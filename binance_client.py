@@ -18,7 +18,7 @@ from exceptions import (
     APIErrorRecoveryStrategy, create_error_context
 )
 
-logger = get_trading_logger('api_client')
+logger = get_trading_logger('api_binance_client')
 
 @dataclass
 class RateLimitInfo:
@@ -471,6 +471,27 @@ class BinanceClient:
             health_info['status'] = 'healthy'
             
         return health_info
+    
+    def get_exchange_info(self, symbol: Optional[str] = None) -> Dict:
+        """Get exchange information (symbols, filters, trading rules)"""
+        try:
+            endpoint = "/api/v3/exchangeInfo"
+            params = {}
+            if symbol:
+                params["symbol"] = symbol.upper()
+
+            # Public endpoint, so no signature needed
+            url = f"{self.base_url}{endpoint}"
+            response = requests.get(url, params=params, timeout=(self.connect_timeout, self.request_timeout))
+            response.raise_for_status()
+            data = response.json()
+
+            return data
+
+        except Exception as e:
+            logger.error(f"Error fetching exchange info: {e}")
+            return {}
+
 
     from typing import TYPE_CHECKING, Dict
     if TYPE_CHECKING:

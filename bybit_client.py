@@ -18,7 +18,7 @@ from exceptions import (
     APIErrorRecoveryStrategy, create_error_context
 )
 
-logger = get_trading_logger('api_client')
+logger = get_trading_logger('api_bybit_client')
 
 @dataclass
 class RateLimitInfo:
