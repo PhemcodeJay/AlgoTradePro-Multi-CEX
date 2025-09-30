@@ -33,10 +33,12 @@ class BinanceClient:
     def __init__(self):
         self.api_key = os.getenv("BINANCE_API_KEY", "")
         self.api_secret = os.getenv("BINANCE_API_SECRET", "")
-        self.testnet = os.getenv("BINANCE_TESTNET", "false").lower() == "true"
-        
-        self.base_url = "https://testnet.binance.vision" if self.testnet else "https://api.binance.com"
-        self.ws_url = "wss://testnet.binance.vision" if self.testnet else "wss://stream.binance.com:9443"
+        self.account_type = os.getenv("BINANCE_ACCOUNT_TYPE", "SPOT").upper()  # optional: SPOT, MARGIN, FUTURES
+
+        # Mainnet only
+        self.base_url = "https://api.binance.com"
+        self.ws_url = "wss://stream.binance.com:9443"
+
         
         # Connection and session management
         self.session: Optional[requests.Session] = None
@@ -72,7 +74,7 @@ class BinanceClient:
         # Start background event loop for WebSocket
         self._start_background_loop()
         
-        logger.info(f"BinanceClient initialized - Environment: {'testnet' if self.testnet else 'mainnet'}")
+        logger.info(f"BinanceClient initialized - Environment: mainnet - Account Type: {self.account_type}")
     
     def _initialize_session(self):
         """Initialize HTTP session with proper configuration"""
@@ -403,16 +405,17 @@ class BinanceClient:
                 "API connection test successful",
                 extra={
                     'endpoint': '/api/v3/ping',
-                    'environment': 'testnet' if self.testnet else 'mainnet'
+                    'environment': 'mainnet'
                 }
             )
+
             return True
             
         except APIAuthenticationException as e:
             self._connected = False
             logger.error(
                 f"API authentication failed during connection test: {str(e)}",
-                extra={'error_type': 'authentication', 'testnet': self.testnet}
+                extra={'error_type': 'authentication', 'environment': 'mainnet'}
             )
             return False
             
@@ -444,7 +447,7 @@ class BinanceClient:
         """Get comprehensive connection health information"""
         health_info = {
             'connected': self._connected,
-            'environment': 'testnet' if self.testnet else 'mainnet',
+            'environment': 'mainnet',
             'api_configured': bool(self.api_key and self.api_secret),
             'last_successful_request': self.last_successful_request.isoformat() if self.last_successful_request else None,
             'consecutive_errors': self.consecutive_errors,
