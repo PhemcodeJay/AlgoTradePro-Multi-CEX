@@ -23,7 +23,38 @@ def load_settings() -> Dict[str, Any]:
         "USE_WEBSOCKET": True,
         "MAX_POSITIONS": 5,
         "MIN_SIGNAL_SCORE": 60,
-        "EXCHANGE": os.getenv("EXCHANGE", "binance")  # 👈 add exchange switch
+        "EXCHANGE": os.getenv("EXCHANGE", "binance"),
+        "AUTO_TRADING_ENABLED": False,
+        "NOTIFICATION_ENABLED": True,
+        "RSI_OVERSOLD": 30,
+        "RSI_OVERBOUGHT": 70,
+        "MIN_VOLUME": 1000000,
+        "MIN_ATR_PCT": 0.5,
+        "MAX_SPREAD_PCT": 0.1,
+        "ML_ENABLED": True,
+        "ML_RETRAIN_THRESHOLD": 100,
+        "MAX_POSITION_SIZE": 10000.0,
+        "MAX_OPEN_POSITIONS": 10,
+        "MAX_DAILY_LOSS": 1000.0,
+        "MAX_RISK_PER_TRADE": 0.05,
+        "binance": {
+            "AUTO_TRADING_ENABLED": False,
+            "RSI_OVERSOLD": 30,
+            "RSI_OVERBOUGHT": 70,
+            "MIN_VOLUME": 1000000,
+            "NOTIFICATION_ENABLED": True,
+            "ML_ENABLED": True,
+            "ML_RETRAIN_THRESHOLD": 100
+        },
+        "bybit": {
+            "AUTO_TRADING_ENABLED": True,
+            "RSI_OVERSOLD": 25,
+            "RSI_OVERBOUGHT": 75,
+            "MIN_VOLUME": 500000,
+            "NOTIFICATION_ENABLED": False,
+            "ML_ENABLED": True,
+            "ML_RETRAIN_THRESHOLD": 200
+        }
     }
 
     try:
@@ -43,7 +74,7 @@ def load_settings() -> Dict[str, Any]:
                 settings[key] = value
             else:
                 try:
-                    if isinstance(value, (int, float)):
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
                         settings[key] = float(settings[key])
                         if key in ["LEVERAGE", "RISK_PCT", "VIRTUAL_BALANCE", "ENTRY_BUFFER_PCT"] and settings[key] <= 0:
                             logger.warning(f"Invalid {key} {settings[key]}, using default {value}")
@@ -91,15 +122,21 @@ def save_settings(settings: Dict[str, Any]) -> bool:
         return False
 
 
-def validate_env(exchange: str | None = None) -> bool:
+from typing import Optional
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+def validate_env(exchange: Optional[str] = None, allow_virtual: bool = True) -> bool:
     """
     Validate required environment variables depending on exchange.
     Defaults to settings.json EXCHANGE if not provided.
+    If allow_virtual is True, missing API keys won't cause validation to fail.
     """
     settings = load_settings()
-    # ensure exchange is always str
-    exchange_val = exchange if exchange is not None else settings.get("EXCHANGE", "binance")
-    exchange = str(exchange_val).lower()
+    exchange = exchange if exchange is not None else settings.get("EXCHANGE", "binance")
+    exchange = str(exchange).lower()
 
     required_vars = []
     if exchange == "binance":
@@ -113,8 +150,11 @@ def validate_env(exchange: str | None = None) -> bool:
 
     missing_required = [var for var in required_vars if not os.getenv(var)]
     if missing_required:
-        logger.error(f"Missing required env vars for {exchange}: {', '.join(missing_required)}")
-        return False
+        if allow_virtual:
+            logger.warning(f"Missing API keys for {exchange}: {', '.join(missing_required)}. Running in virtual mode only.")
+        else:
+            logger.error(f"Missing required env vars for {exchange}: {', '.join(missing_required)}")
+            return False
 
     missing_optional = [var for var in optional_vars if not os.getenv(var)]
     if missing_optional:

@@ -1,795 +1,408 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import os
 import json
-import time
 from datetime import datetime, timezone
-from dateutil import parser 
-from typing import List, Dict, Any, Optional, Callable, Union
-from dataclasses import dataclass, asdict, field
-from sqlalchemy import create_engine, Integer, String, Float, DateTime, Boolean, Text, JSON
-from sqlalchemy.orm import sessionmaker, Mapped, mapped_column, Session, declarative_base
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError, OperationalError
-import uuid
+from typing import List, Optional, Dict, Any
+from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import SQLAlchemyError
 from logging_config import get_logger
-from exceptions import (
-    DatabaseException, DatabaseConnectionException, DatabaseTransactionException,
-    DatabaseIntegrityException, DatabaseErrorRecoveryStrategy, create_error_context
-)
 
-# Load exchange from environment
-EXCHANGE = os.getenv("EXCHANGE", "binance").lower()
+logger = get_logger(__name__)
 
-logger = get_logger(__name__, structured_format=True)
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:1234@localhost:5432/Algotrader2")
+TRADING_MODE = os.getenv("TRADING_MODE", "virtual").lower()
 
+# SQLAlchemy setup
 Base = declarative_base()
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-@dataclass
-class Signal:
-    symbol: str
-    interval: str
-    signal_type: str
-    score: float
-    indicators: Dict
-    strategy: str = "Auto"
-    side: str = "BUY"
-    sl: Optional[float] = None
-    tp: Optional[float] = None
-    trail: Optional[float] = None
-    liquidation: Optional[float] = None
-    leverage: int = 10
-    margin_usdt: Optional[float] = None
-    entry: Optional[float] = None
-    market: Optional[str] = None
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    id: Union[str, None] = None
-    exchange: str = field(default_factory=lambda: EXCHANGE)
-
-    def __post_init__(self):
-        # Auto-generate UUID if no id provided
-        if not self.id:
-            self.id = str(uuid.uuid4())
-        # Normalize side to uppercase
-        self.side = self.side.upper()
-        # Ensure created_at is UTC-aware
-        if self.created_at and self.created_at.tzinfo is None:
-            self.created_at = self.created_at.replace(tzinfo=timezone.utc)
-
-    def to_dict(self) -> Dict:
-        data = asdict(self)
-        if self.created_at:
-            data["created_at"] = self.created_at.isoformat()
-        return data
-
-@dataclass
-class Trade:
-    symbol: str
-    side: str
-    qty: float
-    entry_price: float
-    order_id: str
-    virtual: bool = True
-    status: str = "open"
-    exit_price: Optional[float] = None
-    pnl: Optional[float] = None
-    score: Optional[float] = None
-    strategy: str = "Manual"
-    leverage: int = 10
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    closed_at: Optional[datetime] = None
-    id: Union[str, None] = None
-    exchange: str = field(default_factory=lambda: EXCHANGE)
-
-    def __post_init__(self):
-        # Auto-generate UUID if no id provided
-        if not self.id:
-            self.id = str(uuid.uuid4())
-        # Normalize datetimes to UTC-aware
-        if self.timestamp and self.timestamp.tzinfo is None:
-            self.timestamp = self.timestamp.replace(tzinfo=timezone.utc)
-        if self.closed_at and self.closed_at.tzinfo is None:
-            self.closed_at = self.closed_at.replace(tzinfo=timezone.utc)
-
-    def to_dict(self) -> Dict:
-        data = asdict(self)
-        if self.timestamp:
-            data["timestamp"] = self.timestamp.isoformat()
-        if self.closed_at:
-            data["closed_at"] = self.closed_at.isoformat()
-        return data
-
-@dataclass
-class WalletBalance:
-    trading_mode: str  # 'virtual' or 'real'
-    capital: float
-    available: float
-    used: float
-    start_balance: float
-    currency: str = "USDT"
-    updated_at: Optional[datetime] = None
-    id: Optional[int] = None
-    exchange: str = field(default_factory=lambda: EXCHANGE)
-
-    def to_dict(self) -> Dict:
-        data = asdict(self)
-        if self.updated_at:
-            data['updated_at'] = self.updated_at.isoformat()
-        return data
-
-@dataclass
-class Feedback:
-    signal: Dict
-    outcome: bool
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    id: Optional[int] = None
-    exchange: str = field(default_factory=lambda: EXCHANGE)
-
-    def to_dict(self) -> Dict:
-        return asdict(self)
-
-# SQLAlchemy Models
-class SignalModel(Base):
-    __tablename__ = 'signals'
+# Models
+class Signal(Base):
+    __tablename__ = "signals"
     
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
-    interval: Mapped[str] = mapped_column(String(10), nullable=False)
-    signal_type: Mapped[str] = mapped_column(String(20), nullable=False)
-    score: Mapped[float] = mapped_column(Float, nullable=False)
-    indicators: Mapped[str] = mapped_column(JSON, nullable=False)  # JSON storage
-    strategy: Mapped[str] = mapped_column(String(20), default="Auto")
-    side: Mapped[str] = mapped_column(String(10), default="Buy")
-    sl: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    tp: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    trail: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    liquidation: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    leverage: Mapped[int] = mapped_column(Integer, default=10)
-    margin_usdt: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    entry: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    market: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
-    exchange: Mapped[str] = mapped_column(String(20), default=EXCHANGE)
-
-    def to_signal(self) -> Signal:
-        return Signal(
-            id=str(self.id),
-            symbol=self.symbol,
-            interval=self.interval,
-            signal_type=self.signal_type,
-            score=self.score,
-            indicators=json.loads(self.indicators) if isinstance(self.indicators, str) else self.indicators,
-            strategy=self.strategy,
-            side=self.side,
-            sl=self.sl,
-            tp=self.tp,
-            trail=self.trail,
-            liquidation=self.liquidation,
-            leverage=self.leverage,
-            margin_usdt=self.margin_usdt,
-            entry=self.entry,
-            market=self.market,
-            created_at=self.created_at,
-            exchange=self.exchange
-        )
-
-class TradeModel(Base):
-    __tablename__ = 'trades'
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    interval = Column(String(10), nullable=False)
+    signal_type = Column(String(10), nullable=False)
+    side = Column(String(10), nullable=False)
+    score = Column(Float, nullable=False)
+    entry = Column(Float, nullable=False)
+    sl = Column(Float, nullable=False)
+    tp = Column(Float, nullable=False)
+    trail = Column(Float, nullable=False)
+    liquidation = Column(Float, nullable=False)
+    leverage = Column(Integer, nullable=False)
+    margin_usdt = Column(Float, nullable=False)
+    market = Column(String(50), nullable=False)
+    indicators = Column(JSON, nullable=True)
+    exchange = Column(String(20), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
     
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
-    side: Mapped[str] = mapped_column(String(10), nullable=False)
-    qty: Mapped[float] = mapped_column(Float, nullable=False)
-    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
-    order_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
-    virtual: Mapped[bool] = mapped_column(Boolean, default=True)
-    status: Mapped[str] = mapped_column(String(20), default="open")
-    exit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    pnl: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    strategy: Mapped[str] = mapped_column(String(20), default="Manual")
-    leverage: Mapped[int] = mapped_column(Integer, default=10)
-    stop_loss: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    take_profit: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
-    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    exchange: Mapped[str] = mapped_column(String(20), default=EXCHANGE)
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'interval': self.interval,
+            'signal_type': self.signal_type,
+            'side': self.side,
+            'score': self.score,
+            'entry': self.entry,
+            'sl': self.sl,
+            'tp': self.tp,
+            'trail': self.trail,
+            'liquidation': self.liquidation,
+            'leverage': self.leverage,
+            'margin_usdt': self.margin_usdt,
+            'market': self.market,
+            'indicators': self.indicators,
+            'exchange': self.exchange,
+            'created_at': self.created_at.isoformat() if self.created_at is not None else None
+        }
 
-    def to_trade(self) -> Trade:
-        return Trade(
-            id=str(self.id),
-            symbol=self.symbol,
-            side=self.side,
-            qty=self.qty,
-            entry_price=self.entry_price,
-            order_id=self.order_id,
-            virtual=self.virtual,
-            status=self.status,
-            exit_price=self.exit_price,
-            pnl=self.pnl,
-            score=self.score,
-            strategy=self.strategy,
-            leverage=self.leverage,
-            stop_loss=self.stop_loss,
-            take_profit=self.take_profit,
-            timestamp=self.timestamp,
-            closed_at=self.closed_at,
-            exchange=self.exchange
-        )
-
-class WalletBalanceModel(Base):
-    __tablename__ = 'wallet_balances'
+class Trade(Base):
+    __tablename__ = "trades"
     
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    trading_mode: Mapped[str] = mapped_column(String(20), nullable=False)
-    capital: Mapped[float] = mapped_column(Float, nullable=False)
-    available: Mapped[float] = mapped_column(Float, nullable=False)
-    used: Mapped[float] = mapped_column(Float, nullable=False)
-    start_balance: Mapped[float] = mapped_column(Float, nullable=False)
-    currency: Mapped[str] = mapped_column(String(10), default="USDT")
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
-    exchange: Mapped[str] = mapped_column(String(20), default=EXCHANGE)
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), nullable=False, index=True)
+    side = Column(String(10), nullable=False)
+    qty = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    exit_price = Column(Float, nullable=True)
+    pnl = Column(Float, nullable=True)
+    status = Column(String(20), default="open", index=True)
+    virtual = Column(Boolean, default=True, nullable=False)
+    leverage = Column(Integer, default=10)
+    sl = Column(Float, nullable=True)
+    tp = Column(Float, nullable=True)
+    trail = Column(Float, nullable=True)
+    margin_usdt = Column(Float, nullable=True)
+    exchange = Column(String(20), nullable=True, index=True)
+    signal_id = Column(Integer, nullable=True)
+    order_id = Column(String(50), nullable=True)
+    error_message = Column(Text, nullable=True)
+    indicators = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'side': self.side,
+            'qty': self.qty,
+            'entry_price': self.entry_price,
+            'exit_price': self.exit_price,
+            'pnl': self.pnl,
+            'status': self.status,
+            'virtual': self.virtual,
+            'leverage': self.leverage,
+            'sl': self.sl,
+            'tp': self.tp,
+            'trail': self.trail,
+            'margin_usdt': self.margin_usdt,
+            'exchange': self.exchange,
+            'signal_id': self.signal_id,
+            'order_id': self.order_id,
+            'error_message': self.error_message,
+            'indicators': self.indicators,
+            'created_at': self.created_at.isoformat() if self.created_at is not None else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at is not None else None
+        }
 
-    def to_wallet_balance(self) -> WalletBalance:
-        return WalletBalance(
-            id=self.id,
-            trading_mode=self.trading_mode,
-            capital=self.capital,
-            available=self.available,
-            used=self.used,
-            start_balance=self.start_balance,
-            currency=self.currency,
-            updated_at=self.updated_at,
-            exchange=self.exchange
-        )
+class WalletBalance(Base):
+    __tablename__ = "wallet_balances"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    account_type = Column(String(20), nullable=False, index=True)
+    available = Column(Float, nullable=False, default=0.0)
+    used = Column(Float, nullable=False, default=0.0)
+    total = Column(Float, nullable=False, default=0.0)
+    currency = Column(String(10), default="USDT")
+    exchange = Column(String(20), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'account_type': self.account_type,
+            'available': self.available,
+            'used': self.used,
+            'total': self.total,
+            'currency': self.currency,
+            'exchange': self.exchange,
+            'updated_at': self.updated_at.isoformat() if self.updated_at is not None else None
+        }
+
+class Settings(Base):
+    __tablename__ = "settings"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(100), nullable=False, unique=True, index=True)
+    value = Column(JSON, nullable=False)
+    description = Column(Text, nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
 class FeedbackModel(Base):
-    __tablename__ = 'feedback'
+    __tablename__ = "ml_feedback"
     
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    signal: Mapped[Dict] = mapped_column(JSON, nullable=False)
-    outcome: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    timestamp: Mapped[str] = mapped_column(String, nullable=False)
-    exchange: Mapped[str] = mapped_column(String(20), default=EXCHANGE)
-
-    def to_feedback(self) -> Feedback:
-        return Feedback(
-            id=self.id,
-            signal=self.signal,
-            outcome=self.outcome,
-            timestamp=self.timestamp,
-            exchange=self.exchange
-        )
-
-class SettingsModel(Base):
-    __tablename__ = 'settings'
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), nullable=False)
+    exchange = Column(String(20), nullable=True)
+    timestamp = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
+    outcome = Column(Boolean, nullable=False)
+    pnl = Column(Float, nullable=True)
+    indicators = Column(JSON, nullable=True)
     
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    key: Mapped[str] = mapped_column(String(50), nullable=False, unique=True)
-    value: Mapped[str] = mapped_column(String(255), nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
-    exchange: Mapped[str] = mapped_column(String(20), default=EXCHANGE)
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'symbol': self.symbol,
+            'exchange': self.exchange,
+            'timestamp': self.timestamp.isoformat() if self.timestamp is not None else None,
+            'outcome': self.outcome,
+            'pnl': self.pnl,
+            'indicators': self.indicators
+        }
+
+class ErrorLog(Base):
+    __tablename__ = "error_logs"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    error_type = Column(String(50), nullable=False)
+    message = Column(Text, nullable=False)
+    error_code = Column(String(50), nullable=True)
+    context = Column(JSON, nullable=True)
+    timestamp = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
+    trading_mode = Column(String(20), nullable=False, default=TRADING_MODE)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'id': self.id,
+            'error_type': self.error_type,
+            'message': self.message,
+            'error_code': self.error_code,
+            'context': self.context,
+            'timestamp': self.timestamp.isoformat() if self.timestamp is not None else None,
+            'trading_mode': self.trading_mode
+        }
 
 class DatabaseManager:
-    engine: Any
-    session: Session
     def __init__(self):
-        self.engine = None
-        self.session = self._initialize_db()
-        self.recovery_strategy = DatabaseErrorRecoveryStrategy()
+        self.session = SessionLocal()
 
-    def _initialize_db(self) -> Session:
-        try:
-            database_url = os.getenv("DATABASE_URL", "sqlite:///algotrader.db")
-            self.engine = create_engine(database_url, echo=False)
-            Base.metadata.create_all(self.engine)
-            SessionLocal = sessionmaker(bind=self.engine)
-            session = SessionLocal()
-            logger.info(f"Database initialized successfully for {EXCHANGE}")
-            return session
-        except Exception as e:
-            error_context = create_error_context(
-                module=__name__,
-                function='_initialize_db'
-            )
-            logger.error(f"Failed to initialize database for {EXCHANGE}: {e}")
-            raise DatabaseConnectionException(
-                f"Database initialization failed for {EXCHANGE}: {e}",
-                context=error_context,
-                original_exception=e
-            )
-    
-    def _get_session(self):
-        if self.session is None:
-            Session = sessionmaker(bind=self.engine)
-            self.session = Session()
-        return self.session
-
-    def _execute_with_retry(self, operation: Callable, operation_name: str):
-        attempt = 0
-        while attempt < self.recovery_strategy.max_retries:
-            if not self.session:
-                error_context = create_error_context(
-                    module=__name__,
-                    function=operation_name,
-                    extra_data={'attempt': attempt}
-                )
-                raise DatabaseConnectionException(
-                    f"Database session not initialized for {operation_name} on {EXCHANGE}",
-                    context=error_context
-                )
-            try:
-                result = operation()
-                self.session.commit()
-                return result
-            except (SQLAlchemyError, OperationalError) as e:
-                attempt += 1
-                self.session.rollback()
-                if not self.recovery_strategy.should_retry(e, attempt):
-                    error_context = create_error_context(
-                        module=__name__,
-                        function=operation_name,
-                        extra_data={'attempt': attempt}
-                    )
-                    raise DatabaseException(
-                        f"Failed to execute {operation_name} for {EXCHANGE} after {attempt} attempts: {e}",
-                        context=error_context,
-                        original_exception=e
-                    )
-                time.sleep(self.recovery_strategy.get_delay(attempt))
-            except Exception as e:
-                self.session.rollback()
-                error_context = create_error_context(
-                    module=__name__,
-                    function=operation_name,
-                    extra_data={'attempt': attempt}
-                )
-                raise DatabaseException(
-                    f"Unexpected error in {operation_name} for {EXCHANGE}: {e}",
-                    context=error_context,
-                    original_exception=e
-                )
-        raise DatabaseException(
-            f"Max retries reached for {operation_name} on {EXCHANGE}",
-            context=create_error_context(module=__name__, function=operation_name)
-        )
-
-    def _safe_transaction(self, operation: Callable, operation_type: str, table: str):
-        def wrapper(*args, **kwargs):
-            if not self.session:
-                raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-            try:
-                result = operation(*args, **kwargs)
-                self.session.commit()
-                return result
-            except IntegrityError as e:
-                self.session.rollback()
-                error_context = create_error_context(
-                    module=__name__,
-                    function=operation.__name__,
-                    extra_data={'table': table}
-                )
-                raise DatabaseIntegrityException(
-                    f"Integrity error in {operation_type} on {table} for {EXCHANGE}: {e}",
-                    constraint=str(e),
-                    context=error_context,
-                    original_exception=e
-                )
-            except SQLAlchemyError as e:
-                self.session.rollback()
-                error_context = create_error_context(
-                    module=__name__,
-                    function=operation.__name__,
-                    extra_data={'table': table}
-                )
-                raise DatabaseTransactionException(
-                    f"Transaction error in {operation_type} on {table} for {EXCHANGE}: {e}",
-                    operation=operation_type,
-                    table=table,
-                    context=error_context,
-                    original_exception=e
-                )
-            except Exception as e:
-                self.session.rollback()
-                error_context = create_error_context(
-                    module=__name__,
-                    function=operation.__name__,
-                    extra_data={'table': table}
-                )
-                raise DatabaseException(
-                    f"Unexpected error in {operation_type} on {table} for {EXCHANGE}: {e}",
-                    context=error_context,
-                    original_exception=e
-                )
-        return wrapper
+    def create_tables(self):
+        Base.metadata.create_all(bind=engine)
 
     def add_signal(self, signal: Signal) -> bool:
-        def _add_signal():
-            if not self.session:
-                raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-            signal_model = SignalModel(
-                symbol=signal.symbol,
-                interval=signal.interval,
-                signal_type=signal.signal_type,
-                score=signal.score,
-                indicators=json.dumps(signal.indicators),
-                strategy=signal.strategy,
-                side=signal.side,
-                sl=signal.sl,
-                tp=signal.tp,
-                trail=signal.trail,
-                liquidation=signal.liquidation,
-                leverage=signal.leverage,
-                margin_usdt=signal.margin_usdt,
-                entry=signal.entry,
-                market=signal.market,
-                created_at=signal.created_at or datetime.now(timezone.utc),
-                exchange=signal.exchange
-            )
-            self.session.add(signal_model)
-            return True
-
         try:
-            result = self._safe_transaction(_add_signal, operation_type="INSERT", table="signals")()
-            logger.info(f"Signal added for {signal.symbol} on {EXCHANGE}")
-            return result
-        except DatabaseException:
-            logger.error(f"Failed to add signal for {signal.symbol} on {EXCHANGE}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error adding signal for {signal.symbol} on {EXCHANGE}: {e}")
+            self.session.add(signal)
+            self.session.commit()
+            logger.debug(f"Signal added for {signal.symbol}")
+            return True
+        except SQLAlchemyError as e:
+            self.session.rollback()
+            logger.error(f"Error adding signal: {e}")
+            return False
+
+    def get_signals(self, limit: int = 10, exchange: Optional[str] = None) -> List[Signal]:
+        try:
+            query = self.session.query(Signal).order_by(Signal.created_at.desc())
+            if exchange:
+                query = query.filter(Signal.exchange == exchange)
+            return query.limit(limit).all()
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching signals: {e}")
+            return []
+
+    def add_trade(self, trade: Trade) -> bool:
+        try:
+            self.session.add(trade)
+            self.session.commit()
+            logger.debug(f"Trade added for {trade.symbol}")
+            return True
+        except SQLAlchemyError as e:
+            self.session.rollback()
+            logger.error(f"Error adding trade: {e}")
+            return False
+
+    def update_trade(self, trade_id: int, updates: Dict[str, Any]) -> bool:
+        try:
+            trade = self.session.query(Trade).filter(Trade.id == trade_id).first()
+            if trade:
+                for key, value in updates.items():
+                    if hasattr(trade, key):
+                        setattr(trade, key, value)
+                trade.updated_at = datetime.now(timezone.utc)  # type: ignore
+                self.session.commit()
+                logger.debug(f"Trade {trade_id} updated")
+                return True
+            return False
+        except SQLAlchemyError as e:
+            self.session.rollback()
+            logger.error(f"Error updating trade: {e}")
             return False
     
-    def add_trade(self, trade: Dict) -> bool:
-        if not self.session:
-            raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-
-        # Convert string timestamps to datetime
-        if isinstance(trade.get("timestamp"), str):
-            trade["timestamp"] = parser.isoparse(trade["timestamp"])
-        elif trade.get("timestamp") is None:
-            trade["timestamp"] = datetime.now(timezone.utc)
-
-        if isinstance(trade.get("closed_at"), str):
-            trade["closed_at"] = parser.isoparse(trade["closed_at"])
-
-        def _add_trade():
-            trade_model = TradeModel(
-                symbol=trade['symbol'],
-                side=trade['side'],
-                qty=trade['qty'],
-                entry_price=trade['entry_price'],
-                order_id=trade['order_id'],
-                virtual=trade.get('virtual', True),
-                status=trade.get('status', 'open'),
-                exit_price=trade.get('exit_price'),
-                pnl=trade.get('pnl'),
-                score=trade.get('score'),
-                strategy=trade.get('strategy', 'Manual'),
-                leverage=trade.get('leverage', 10),
-                stop_loss=trade.get('stop_loss'),
-                take_profit=trade.get('take_profit'),
-                timestamp=trade['timestamp'],
-                closed_at=trade.get('closed_at'),
-                exchange=trade.get('exchange', EXCHANGE)
-            )    
-            self._get_session().add(trade_model)
-            return True
-
+    def get_trades(self, limit: int = 100, symbol: Optional[str] = None, status: Optional[str] = None, virtual: Optional[bool] = None, exchange: Optional[str] = None) -> List[Trade]:
         try:
-            result = self._safe_transaction(_add_trade, operation_type="INSERT", table="trades")()
-            logger.info(f"Trade added for {trade['symbol']} on {EXCHANGE}")
-            return result
-        except DatabaseException:
-            logger.error(f"Failed to add trade for {trade['symbol']} on {EXCHANGE}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error adding trade for {trade['symbol']} on {EXCHANGE}: {e}")
-            return False
-
-    def add_feedback(self, feedback: Feedback) -> bool:
-        def _add_feedback():
-            if not self.session:
-                raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-            feedback_model = FeedbackModel(
-                signal=feedback.signal,
-                outcome=feedback.outcome,
-                timestamp=feedback.timestamp,
-                exchange=feedback.exchange
-            )
-            self.session.add(feedback_model)
-            return True
-
-        try:
-            result = self._safe_transaction(_add_feedback, operation_type="INSERT", table="feedback")()
-            logger.info(f"Feedback added for {feedback.signal.get('symbol', 'unknown')} on {EXCHANGE}")
-            return result
-        except DatabaseException:
-            logger.error(f"Failed to add feedback for {feedback.signal.get('symbol', 'unknown')} on {EXCHANGE}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error adding feedback for {feedback.signal.get('symbol', 'unknown')} on {EXCHANGE}: {e}")
-            return False
-
-    def update_wallet_balance(self, wallet_balance: WalletBalance) -> bool:
-        def _update_wallet_balance():
-            if not self.session:
-                raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-            existing = self.session.query(WalletBalanceModel).filter(
-                WalletBalanceModel.trading_mode == wallet_balance.trading_mode,
-                WalletBalanceModel.exchange == wallet_balance.exchange
-            ).first()
-            if existing:
-                existing.capital = wallet_balance.capital
-                existing.available = wallet_balance.available
-                existing.used = wallet_balance.used
-                existing.start_balance = wallet_balance.start_balance
-                existing.currency = wallet_balance.currency
-                existing.updated_at = wallet_balance.updated_at or datetime.now(timezone.utc)
-                existing.exchange = wallet_balance.exchange
-            else:
-                new_balance = WalletBalanceModel(
-                    trading_mode=wallet_balance.trading_mode,
-                    capital=wallet_balance.capital,
-                    available=wallet_balance.available,
-                    used=wallet_balance.used,
-                    start_balance=wallet_balance.start_balance,
-                    currency=wallet_balance.currency,
-                    updated_at=wallet_balance.updated_at or datetime.now(timezone.utc),
-                    exchange=wallet_balance.exchange
-                )
-                self.session.add(new_balance)
-            return True
-
-        try:
-            result = self._safe_transaction(_update_wallet_balance, operation_type="UPSERT", table="wallet_balances")()
-            logger.info(f"Wallet balance updated for {wallet_balance.trading_mode} on {EXCHANGE}")
-            return result
-        except DatabaseException:
-            logger.error(f"Failed to update wallet balance for {wallet_balance.trading_mode} on {EXCHANGE}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error updating wallet balance for {wallet_balance.trading_mode} on {EXCHANGE}: {e}")
-            return False
-
-    def get_signals(self, limit: int = 100) -> List[Signal]:
-        try:
-            def _get_signals():
-                if not self.session:
-                    raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-                signals = self.session.query(SignalModel).filter(
-                    SignalModel.exchange == EXCHANGE
-                ).order_by(
-                    SignalModel.created_at.desc()
-                ).limit(limit).all()
-                return [s.to_signal() for s in signals]
-            return self._execute_with_retry(_get_signals, "get_signals")
-        except Exception as e:
-            logger.error(f"Error getting signals for {EXCHANGE}: {e}")
+            query = self.session.query(Trade)
+            if symbol:
+                query = query.filter(Trade.symbol == symbol)
+            if status:
+                query = query.filter(Trade.status == status)
+            if virtual is not None:
+                query = query.filter(Trade.virtual == virtual)
+            if exchange:
+                query = query.filter(Trade.exchange == exchange)
+            return query.order_by(Trade.created_at.desc()).limit(limit).all()
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching trades: {e}")
             return []
-
-    def get_trades(self, limit: int = 100) -> List[Trade]:
+    
+    def get_trade_by_id(self, trade_id: int) -> Optional[Trade]:
         try:
-            def _get_trades():
-                if not self.session:
-                    raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-                trades = self.session.query(TradeModel).filter(
-                    TradeModel.exchange == EXCHANGE
-                ).order_by(
-                    TradeModel.timestamp.desc()
-                ).limit(limit).all()
-                return [t.to_trade() for t in trades]
-            return self._execute_with_retry(_get_trades, "get_trades")
-        except Exception as e:
-            logger.error(f"Error getting trades for {EXCHANGE}: {e}")
-            return []
-
-    def get_feedback(self, limit: int = 100) -> List[Feedback]:
-        try:
-            def _get_feedback():
-                if not self.session:
-                    raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-                feedback = self.session.query(FeedbackModel).filter(
-                    FeedbackModel.exchange == EXCHANGE
-                ).order_by(
-                    FeedbackModel.timestamp.desc()
-                ).limit(limit).all()
-                return [f.to_feedback() for f in feedback]
-            return self._execute_with_retry(_get_feedback, "get_feedback")
-        except Exception as e:
-            logger.error(f"Error getting feedback for {EXCHANGE}: {e}")
-            return []
-
-    def get_wallet_balance(self, trading_mode: str) -> Optional[WalletBalance]:
-        try:
-            def _get_wallet_balance():
-                if not self.session:
-                    raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-                balance = self.session.query(WalletBalanceModel).filter(
-                    WalletBalanceModel.trading_mode == trading_mode,
-                    WalletBalanceModel.exchange == EXCHANGE
-                ).first()
-                return balance.to_wallet_balance() if balance else None
-            return self._execute_with_retry(_get_wallet_balance, f"get_wallet_balance_{trading_mode}")
-        except Exception as e:
-            logger.error(f"Error getting wallet balance for {trading_mode} on {EXCHANGE}: {e}")
+            return self.session.query(Trade).filter(Trade.id == trade_id).first()
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching trade {trade_id}: {e}")
             return None
-
-    def migrate_capital_json_to_db(self, capital_file_path: str = "capital.json") -> bool:
+    
+    def get_wallet_balance(self, account_type: str, exchange: Optional[str] = None) -> Optional[WalletBalance]:
         try:
-            if not os.path.exists(capital_file_path):
-                logger.warning(f"Capital file {capital_file_path} not found, initializing default balances for {EXCHANGE}")
-                default_virtual = WalletBalance(
-                    trading_mode="virtual",
-                    capital=1000.0,
-                    available=1000.0,
-                    used=0.0,
-                    start_balance=1000.0,
-                    currency="USDT",
-                    updated_at=datetime.now(timezone.utc),
-                    exchange=EXCHANGE
-                )
-                default_real = WalletBalance(
-                    trading_mode="real",
-                    capital=0.0,
-                    available=0.0,
-                    used=0.0,
-                    start_balance=0.0,
-                    currency="USDT",
-                    updated_at=datetime.now(timezone.utc),
-                    exchange=EXCHANGE
-                )
-                self.update_wallet_balance(default_virtual)
-                self.update_wallet_balance(default_real)
-                return True
-
-            with open(capital_file_path, "r") as f:
-                capital_data = json.load(f)
-
-            # Migrate virtual balance
-            if "virtual" in capital_data:
-                v = capital_data["virtual"]
-                virtual_balance = WalletBalance(
-                    trading_mode="virtual",
-                    capital=float(v.get("capital", 1000.0)),
-                    available=float(v.get("available", 1000.0)),
-                    used=float(v.get("used", 0.0)),
-                    start_balance=float(v.get("start_balance", 1000.0)),
-                    currency=v.get("currency", "USDT"),
-                    updated_at=datetime.now(timezone.utc),
-                    exchange=EXCHANGE
-                )
-                self.update_wallet_balance(virtual_balance)
-                logger.info(f"Virtual balance migrated to database for {EXCHANGE}")
-
-            # Migrate real balance  
-            if "real" in capital_data:
-                r = capital_data["real"]
-                real_balance = WalletBalance(
-                    trading_mode="real",
-                    capital=float(r.get("capital", 0.0)),
-                    available=float(r.get("available", 0.0)),
-                    used=float(r.get("used", 0.0)),
-                    start_balance=float(r.get("start_balance", 0.0)),
-                    currency=r.get("currency", "USDT"),
-                    updated_at=datetime.now(timezone.utc),
-                    exchange=EXCHANGE
-                )
-                self.update_wallet_balance(real_balance)
-                logger.info(f"Real balance migrated to database for {EXCHANGE}")
-
-            logger.info(f"Capital.json data successfully migrated to database for {EXCHANGE}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error migrating capital.json to database for {EXCHANGE}: {e}")
-            return False
-
-    def get_all_wallet_balances(self) -> Dict[str, WalletBalance]:
-        """Get all wallet balances as a dictionary"""
-        if not self.session:
-            logger.error(f"Database session not initialized for {EXCHANGE}")
-            return {}
-        try:
-            models = self.session.query(WalletBalanceModel).filter(
-                WalletBalanceModel.exchange == EXCHANGE
-            ).all()
-            return {model.trading_mode: model.to_wallet_balance() for model in models}
-        except Exception as e:
-            logger.error(f"Error getting all wallet balances for {EXCHANGE}: {e}")
-            return {}
-
-    def save_setting(self, key: str, value: str) -> bool:
-        """Save a setting to the database"""
-        def _save_setting_operation():
-            if not self.session:
-                raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-            setting = self.session.query(SettingsModel).filter(
-                SettingsModel.key == key,
-                SettingsModel.exchange == EXCHANGE
-            ).first()
-            if setting:
-                setting.value = value
-                setting.updated_at = datetime.now(timezone.utc)
-                setting.exchange = EXCHANGE
-            else:
-                setting = SettingsModel(
-                    key=key,
-                    value=value,
-                    updated_at=datetime.now(timezone.utc),
-                    exchange=EXCHANGE
-                )
-                self.session.add(setting)
-            return True
-
-        try:
-            result = self._safe_transaction(_save_setting_operation, operation_type="UPSERT", table="settings")()
-            logger.info(f"Saved setting {key} with value {value} for {EXCHANGE}")
-            return result
-        except DatabaseException:
-            logger.error(f"Database exception saving setting {key} for {EXCHANGE}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error saving setting {key} for {EXCHANGE}: {str(e)}")
-            return False
-
-    def get_setting(self, key: str) -> Optional[str]:
-        """Retrieve a setting from the database"""
-        def _get_setting_operation():
-            if not self.session:
-                raise DatabaseConnectionException(f"Database session not initialized for {EXCHANGE}")
-            setting = self.session.query(SettingsModel).filter(
-                SettingsModel.key == key,
-                SettingsModel.exchange == EXCHANGE
-            ).first()
-            return setting.value if setting else None
-
-        try:
-            result = self._execute_with_retry(_get_setting_operation, f"get_setting_{key}")
-            logger.info(f"Retrieved setting {key}: {result} for {EXCHANGE}")
-            return result
-        except DatabaseException:
-            logger.error(f"Failed to get setting {key} for {EXCHANGE}")
-            raise
-        except Exception as e:
-            logger.error(f"Unexpected error getting setting {key} for {EXCHANGE}: {str(e)}")
+            query = self.session.query(WalletBalance).filter(WalletBalance.account_type == account_type)
+            if exchange:
+                query = query.filter(WalletBalance.exchange == exchange)
+            return query.first()
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching wallet balance: {e}")
             return None
-
-    def close(self):
-        """Close database connection"""
+    
+    def update_wallet_balance(self, account_type: str, available: float, used: float = 0.0, exchange: Optional[str] = None) -> bool:
         try:
-            if self.session:
-                self.session.close()
-            if self.engine:
-                self.engine.dispose()
-            logger.info(f"Database connection closed successfully for {EXCHANGE}")
-        except Exception as e:
-            logger.error(f"Failed to close database connection for {EXCHANGE}: {str(e)}")
-
-    def get_connection_stats(self) -> Dict[str, Any]:
-        """Get database connection statistics"""
-        stats = {
-            'pool_status': 'unknown',
-            'checked_out': 0,
-            'overflow': 0,
-            'pool_size': 0
-        }
-        
-        try:
-            if self.engine and hasattr(self.engine, 'pool'):
-                pool = self.engine.pool
-                stats.update({
-                    'pool_status': 'active',
-                    'checked_out': getattr(pool, 'checkedout', 0),
-                    'overflow': getattr(pool, 'overflow', 0),
-                    'pool_size': getattr(pool, 'size', 0)
-                })
-        except Exception as e:
-            stats['error'] = str(e)
+            wallet = self.session.query(WalletBalance).filter(WalletBalance.account_type == account_type).first()
+            if wallet:
+                wallet.available = available  # type: ignore
+                wallet.used = used  # type: ignore
+                wallet.total = available + used  # type: ignore
+                if exchange:
+                    wallet.exchange = exchange  # type: ignore
+                wallet.updated_at = datetime.now(timezone.utc)  # type: ignore
+            else:
+                wallet = WalletBalance(
+                    account_type=account_type,
+                    available=available,
+                    used=used,
+                    total=available + used,
+                    exchange=exchange
+                )
+                self.session.add(wallet)
             
-        return stats
+            self.session.commit()
+            logger.debug(f"Wallet balance updated for {account_type}")
+            return True
+        except SQLAlchemyError as e:
+            self.session.rollback()
+            logger.error(f"Error updating wallet balance: {e}")
+            return False
+    
+    def add_feedback(self, feedback: FeedbackModel) -> bool:
+        try:
+            self.session.add(feedback)
+            self.session.commit()
+            logger.debug(f"Feedback added for {feedback.symbol}")
+            return True
+        except SQLAlchemyError as e:
+            self.session.rollback()
+            logger.error(f"Error adding feedback: {e}")
+            return False
+    
+    def get_feedback(self, limit: int = 100, exchange: Optional[str] = None) -> List[FeedbackModel]:
+        try:
+            query = self.session.query(FeedbackModel)
+            if exchange:
+                query = query.filter(FeedbackModel.exchange == exchange)
+            return query.order_by(FeedbackModel.timestamp.desc()).limit(limit).all()
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching feedback: {e}")
+            return []
+    
+    def add_error_log(self, error_log: ErrorLog) -> bool:
+        try:
+            self.session.add(error_log)
+            self.session.commit()
+            logger.debug(f"Error log added: {error_log.error_type} - {error_log.message}")
+            return True
+        except SQLAlchemyError as e:
+            self.session.rollback()
+            logger.error(f"Error adding error log: {e}")
+            return False
+    
+    def get_trade(self, order_id: str) -> Optional[Trade]:
+        try:
+            trade = self.session.query(Trade).filter(Trade.order_id == order_id).first()
+            if trade:
+                logger.debug(f"Trade retrieved for order_id: {order_id}")
+            else:
+                logger.warning(f"No trade found for order_id: {order_id}")
+            return trade
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching trade for order_id {order_id}: {e}")
+            return None
+    
+    def get_trade_by_position(self, symbol: str, exchange: str, virtual: bool) -> Optional[Trade]:
+        try:
+            trade = self.session.query(Trade).filter(
+                Trade.symbol == symbol,
+                Trade.exchange == exchange,
+                Trade.virtual == virtual,
+                Trade.status == "open"
+            ).first()
+            if trade:
+                logger.debug(f"Trade retrieved for position: {symbol} - {exchange} - virtual: {virtual}")
+            else:
+                logger.warning(f"No open trade found for position: {symbol} - {exchange} - virtual: {virtual}")
+            return trade
+        except SQLAlchemyError as e:
+            logger.error(f"Error fetching trade for position {symbol} - {exchange}: {e}")
+            return None
+    
+    def migrate_capital_json_to_db(self, capital_file: str = "capital.json"):
+        try:
+            if os.path.exists(capital_file):
+                with open(capital_file, 'r') as f:
+                    capital_data = json.load(f)
+                
+                if 'virtual' in capital_data:
+                    virtual_balance = capital_data['virtual']
+                    self.update_wallet_balance(
+                        "virtual",
+                        available=virtual_balance.get("available", 100.0),
+                        used=virtual_balance.get("used", 0.0)
+                    )
+                
+                if 'real' in capital_data:
+                    real_balance = capital_data['real']
+                    self.update_wallet_balance(
+                        "real",
+                        available=real_balance.get("available", 0.0),
+                        used=real_balance.get("used", 0.0)
+                    )
+                
+                logger.info("Capital data migrated to database")
+            else:
+                self.update_wallet_balance("virtual", available=100.0, used=0.0)
+                logger.info("Default virtual wallet balance created")
+                
+        except Exception as e:
+            logger.error(f"Error migrating capital data: {e}")
 
 # Global database manager instance
 db_manager = DatabaseManager()
+
+# Initialize database on import
+try:
+    db_manager.create_tables()
+    db_manager.migrate_capital_json_to_db()
+except Exception as e:
+    logger.error(f"Database initialization failed: {e}")

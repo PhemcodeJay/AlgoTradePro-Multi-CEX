@@ -1,476 +1,254 @@
 import asyncio
-from dataclasses import asdict
 import time
-from datetime import datetime, timezone
+import threading
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
-from sqlalchemy import update, text
-from multi_trading_engine import TradingEngine
-from binance_client import BinanceClient
-from bybit_client import BybitClient
-from signal_generator import generate_signals, get_usdt_symbols
-from db import db_manager, Trade, Signal, TradeModel
+from signal_generator import generate_signals, get_symbols, get_signal_summary
+from ml import MLFilter
+from notifications import send_all_notifications
 from logging_config import get_trading_logger
+from exceptions import TradingException, create_error_context
 
-logger = get_trading_logger(__name__)
+logger = get_trading_logger('automated')
 
 class AutomatedTrader:
-    def __init__(self, engine: TradingEngine):
-        self.engine = engine
-        # Dynamic client based on engine exchange
-        self.client = BinanceClient() if engine.exchange == "binance" else BybitClient()
-        self.db = db_manager
-        self.min_signal_score = 50.0
-        self.is_running = False
-        self.task = None
-        self.stop_event = asyncio.Event()
+    def __init__(self, trading_engine):
+        self.trading_engine = trading_engine
+        self.running = False
+        self.thread = None
+        self.last_scan_time = None
+        self.scan_count = 0
+        self.total_signals_generated = 0
+        self.successful_trades = 0
+        self.failed_trades = 0
         
-        # Trading parameters from engine settings
-        self.scan_interval, self.top_n_signals = self.engine.get_settings()
-        if self.scan_interval <= 0 or self.top_n_signals <= 0:
-            raise ValueError("Invalid settings: scan_interval and top_n_signals must be positive")
-        self.max_positions = self.engine.max_open_positions
-        self.risk_per_trade = self.engine.max_risk_per_trade
-        self.leverage = self.engine.settings.get("LEVERAGE", 10)
+        # Configuration
+        self.scan_interval = 3600  # 1 hour default
+        self.top_n_signals = 10
+        self.auto_trading_enabled = False
+        self.notification_enabled = True
         
-        # Statistics
-        self.stats = {
-            "signals_generated": 0,
-            "trades_executed": 0,
-            "profitable_trades": 0,
-            "total_pnl": 0.0,
-            "start_time": None,
-            "last_scan": None
-        }
+        # Load settings
+        self._load_settings()
         
-        logger.info(f"Automated trader initialized for {self.engine.exchange} "
-                    f"with scan_interval={self.scan_interval}, max_positions={self.max_positions}, "
-                    f"risk_per_trade={self.risk_per_trade}, leverage={self.leverage}")
-
-    def _ensure_session(self):
-        """Ensure active DB session."""
-        try:
-            session = self.db._get_session()
-            if not session.is_active:
-                session.rollback()
-            session.execute(text("SELECT 1"))
-            session.commit()
-        except Exception as e:
-            logger.error(f"Failed to ensure database session: {e}", exc_info=True)
-            raise
+        logger.info(f"AutomatedTrader initialized for {self.trading_engine.exchange_name}")
     
-    async def start(self, status_container=None) -> bool:
-        """Start automated trading"""
+    def _load_settings(self):
+        """Load settings from trading engine"""
         try:
-            if self.is_running:
-                logger.warning("Automated trader already running")
+            self.scan_interval, self.top_n_signals = self.trading_engine.get_settings()
+            settings = self.trading_engine.settings
+            self.auto_trading_enabled = settings.get("AUTO_TRADING_ENABLED", False)
+            self.notification_enabled = settings.get("NOTIFICATION_ENABLED", True)
+            
+            logger.info(f"Settings loaded: scan_interval={self.scan_interval}s, top_n={self.top_n_signals}")
+        except Exception as e:
+            logger.error(f"Error loading settings: {e}")
+    
+    def start(self) -> bool:
+        """Start the automated trading loop"""
+        try:
+            if self.running:
+                logger.warning("Automated trader is already running")
                 return False
             
-            if not self.engine.is_trading_enabled():
-                logger.warning("Cannot start: Trading engine is disabled or in emergency stop")
+            if not self.trading_engine.is_trading_enabled():
+                logger.warning("Trading engine is not enabled")
                 return False
             
-            self.is_running = True
-            self.stop_event.clear()
-            self.stats["start_time"] = datetime.now(timezone.utc)
+            self.running = True
+            self.thread = threading.Thread(target=self._trading_loop, daemon=True)
+            self.thread.start()
             
-            # Start the main trading loop
-            self.task = asyncio.create_task(self._trading_loop(status_container))
-            
-            logger.info("Automated trading started")
-            if status_container:
-                status_container.success(f"🤖 Automated trading started on {self.engine.exchange}")
+            logger.info("Automated trader started")
             return True
             
         except Exception as e:
-            logger.error(f"Error starting automated trader: {e}", exc_info=True)
-            self.is_running = False
-            if status_container:
-                status_container.error(f"Failed to start trading: {e}")
+            logger.error(f"Failed to start automated trader: {e}")
             return False
     
-    async def stop(self) -> bool:
-        """Stop automated trading"""
+    def stop(self) -> bool:
+        """Stop the automated trading loop"""
         try:
-            if not self.is_running:
-                logger.info("Automated trader already stopped")
-                return True
+            if not self.running:
+                logger.warning("Automated trader is not running")
+                return False
             
-            self.is_running = False
-            self.stop_event.set()
+            self.running = False
+            if self.thread and self.thread.is_alive():
+                self.thread.join(timeout=10)
             
-            if self.task:
-                self.task.cancel()
-                try:
-                    await self.task
-                except asyncio.CancelledError:
-                    pass
-            
-            logger.info("Automated trading stopped")
+            logger.info("Automated trader stopped")
             return True
             
         except Exception as e:
-            logger.error(f"Error stopping automated trader: {e}", exc_info=True)
+            logger.error(f"Failed to stop automated trader: {e}")
             return False
-
-    async def get_status(self) -> Dict[str, Any]:
-        """Get current trading status"""
-        try:
-            return {
-                "is_running": self.is_running,
-                "stats": self.stats.copy(),
-                "current_positions": len(self._get_open_trades()),
-                "max_positions": self.max_positions,
-                "scan_interval": self.scan_interval,
-                "risk_per_trade": self.risk_per_trade,
-                "leverage": self.leverage,
-                "exchange": self.engine.exchange
-            }
-        except Exception as e:
-            logger.error(f"Error getting trader status: {e}", exc_info=True)
-            return {}
-
-    async def reset_stats(self):
-        """Reset trading statistics"""
-        try:
-            self.stats = {
-                "signals_generated": 0,
-                "trades_executed": 0,
-                "profitable_trades": 0,
-                "total_pnl": 0.0,
-                "start_time": datetime.now(timezone.utc),
-                "last_scan": None
-            }
-            logger.info("Trading statistics reset")
-        except Exception as e:
-            logger.error(f"Error resetting stats: {e}", exc_info=True)
     
-    async def _trading_loop(self, status_container=None):
-        """Main automated trading loop"""
+    def _trading_loop(self):
+        """Main trading loop"""
+        logger.info("Automated trading loop started")
+        
+        while self.running:
+            try:
+                # Check if trading is still enabled
+                if not self.trading_engine.is_trading_enabled():
+                    logger.warning("Trading engine disabled, stopping trading loop")
+                    self.stop()
+                    return
+                
+                asyncio.run(self._execute_trading_cycle())
+                
+                # Sleep until next scan
+                time.sleep(self.scan_interval)
+                
+            except Exception as e:
+                logger.error(f"Error in trading loop: {e}")
+                time.sleep(60)  # Prevent tight loop on error
+    
+    async def _execute_trading_cycle(self):
+        """Execute one cycle of trading operations"""
         try:
-            while self.is_running and not self.stop_event.is_set():
-                try:
-                    # Update status
-                    if status_container:
-                        status_container.info(f"🤖 Scanning markets... Last scan: {self.stats.get('last_scan', 'Never')}")
-                    
-                    # Sync real balance if in real mode
-                    trading_mode = self.db.get_setting("trading_mode") or "virtual"
-                    if trading_mode == "real":
-                        self.engine.sync_real_balance()
-                    
-                    # Scan for signals and execute trades
-                    await self._scan_and_trade(trading_mode)
-                    
-                    # Monitor existing positions
-                    await self._monitor_positions(trading_mode)
-                    
-                    # Update last scan time
-                    self.stats["last_scan"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    # Wait for next scan
-                    await asyncio.sleep(self.scan_interval)
-                    
-                except Exception as e:
-                    logger.error(f"Error in trading loop: {e}", exc_info=True)
-                    if status_container:
-                        status_container.warning(f"Trading loop error: {e}")
-                    await asyncio.sleep(60)  # Wait 1 minute on error
-                    
-        except asyncio.CancelledError:
-            logger.info("Trading loop cancelled")
-        except Exception as e:
-            logger.error(f"Trading loop error: {e}", exc_info=True)
-            if status_container:
-                status_container.error(f"Trading loop failed: {e}")
-        finally:
-            self.is_running = False
-            if self.db.session:
-                try:
-                    self.db.session.close()
-                except Exception as e:
-                    logger.error(f"Error closing database session: {e}", exc_info=True)
-            if status_container:
-                status_container.info(f"🤖 Automated trading stopped on {self.engine.exchange}")
-
-    async def _scan_and_trade(self, trading_mode: str):
-        """Scan markets and execute trades"""
-        try:
-            if trading_mode not in ["real", "virtual"]:
-                logger.error(f"Invalid trading mode: {trading_mode}")
-                return
+            self.scan_count += 1
+            self.last_scan_time = datetime.now(timezone.utc)
             
-            # Check position limits
-            current_positions = len(self._get_open_trades(trading_mode))
-            if current_positions >= self.max_positions:
-                logger.info(f"Max positions reached: {current_positions}/{self.max_positions}")
+            # Get USDT symbols
+            symbols = get_symbols(limit=50)
+            if not symbols:
+                logger.warning("No symbols retrieved for trading")
                 return
-            
-            # Get symbols to scan
-            symbols = await get_usdt_symbols(client=self.client)
             
             # Generate signals
-            signals = await generate_signals(
-                symbols,
-                interval="60",
-                top_n=self.top_n_signals,
-                trading_mode=trading_mode,
-                client=self.client
-            )
-            self.stats["signals_generated"] += len(signals)
-            logger.info(f"Generated {len(signals)} signals, processing up to {self.top_n_signals}")
+            signals = generate_signals(symbols, interval="60", top_n=self.top_n_signals)
+            self.total_signals_generated += len(signals)
+            
+            # Log signal summary
+            summary = get_signal_summary(signals)
+            logger.info(f"Trading cycle completed: {summary}")
             
             if not signals:
-                logger.info("No signals generated")
+                logger.info("No signals generated in this cycle")
                 return
             
-            # Execute top signals
-            available_slots = self.max_positions - current_positions
-            for signal in signals[:min(self.top_n_signals, available_slots)]:
-                try:
-                    await self._execute_signal(signal, trading_mode)
-                except Exception as e:
-                    logger.error(f"Error executing signal for {signal.get('symbol', 'unknown')}: {e}", exc_info=True)
-                    
+            # Send notifications if enabled
+            if self.notification_enabled:
+                send_all_notifications(signals)
+            
+            # Execute trades if auto-trading enabled
+            if self.auto_trading_enabled:
+                for signal in signals:
+                    try:
+                        # Ensure symbol is in correct format
+                        symbol = signal.get('symbol', '').replace('/', '')
+                        signal['symbol'] = symbol
+                        success = await self.trading_engine.execute_trade(signal)
+                        if success:
+                            self.successful_trades += 1
+                            logger.info(f"Trade executed for {symbol}")
+                        else:
+                            self.failed_trades += 1
+                            logger.warning(f"Trade execution failed for {symbol}")
+                    except Exception as e:
+                        self.failed_trades += 1
+                        logger.error(f"Error executing trade for {signal.get('symbol')}: {e}")
+            
+            # Update ML model with recent trade outcomes
+            self._update_ml_feedback()
+            
         except Exception as e:
-            logger.error(f"Error in scan and trade: {e}", exc_info=True)
+            logger.error(f"Error in trading cycle: {e}")
     
-    async def _get_price_with_retry(self, symbol: str, max_attempts: int = 3, delay: float = 1.0) -> float:
-        """Fetch price with retry logic"""
-        for attempt in range(1, max_attempts + 1):
-            try:
-                price = self.client.get_current_price(symbol)
-                if price > 0:
-                    return price
-                logger.warning(f"Invalid price for {symbol}: {price}")
-            except Exception as e:
-                logger.warning(f"Price fetch attempt {attempt} failed for {symbol}: {e}")
-                if attempt == max_attempts:
-                    logger.error(f"Failed to fetch price for {symbol} after {max_attempts} attempts")
-                    return 0.0
-                await asyncio.sleep(delay)
-        return 0.0
-
-    async def _execute_signal(self, signal: Dict[str, Any], trading_mode: str):
-        """Execute a signal"""
+    def _update_ml_feedback(self):
+        """Update ML model with trade outcomes"""
         try:
-            required_fields = ["symbol", "side", "score"]
-            for field in required_fields:
-                if field not in signal or signal[field] is None:
-                    logger.warning(f"Signal missing required field: {field}")
-                    return
-            
-            symbol = signal["symbol"]
-            side = signal["side"].upper()
-            score = float(signal["score"])
-            
-            if side not in ["BUY", "SELL", "LONG", "SHORT"]:
-                logger.warning(f"Invalid side for {symbol}: {side}")
-                return
-            
-            if score < self.min_signal_score:
-                logger.info(f"Signal score too low for {symbol}: {score} < {self.min_signal_score}")
-                return
-            
-            entry_price = signal.get("entry") or await self._get_price_with_retry(symbol)
-            if entry_price <= 0:
-                logger.warning(f"Invalid entry price for {symbol}: {entry_price}")
-                return
-            
-            position_size = self.engine.calculate_position_size(symbol, entry_price)
-            if position_size <= 0:
-                logger.warning(f"Invalid position size for {symbol}: {position_size}")
-                return
-            
-            trade = Trade(
-                symbol=symbol,
-                side=side,
-                qty=position_size,
-                entry_price=entry_price,
-                order_id=f"auto_{symbol}_{int(time.time())}",
-                virtual=(trading_mode == "virtual"),
-                status="open",
-                score=score,
-                strategy="Automated",
-                leverage=self.leverage,
-                timestamp=datetime.now(timezone.utc)
+            # Get recent trades from DB
+            recent_trades = self.trading_engine.db.get_recent_trades(
+                hours=24,
+                exchange=self.trading_engine.exchange_name
             )
-            
-            trade_dict = asdict(trade)
-            
-            success = self.db.add_trade(trade_dict)
-            if success:
-                self.stats["trades_executed"] += 1
-                logger.info(f"Automated trade executed: {symbol} {side} @ {entry_price}, Mode: {trading_mode}, Trade ID: {trade.order_id}")
-                
-                signal_obj = Signal(
-                    symbol=symbol,
-                    interval=signal.get("interval", "60"),
-                    signal_type=signal.get("signal_type", "Auto"),
-                    score=score,
-                    indicators=signal.get("indicators", {}),
-                    side=side,
-                    sl=signal.get("sl"),
-                    tp=signal.get("tp"),
-                    trail=signal.get("trail"),
-                    liquidation=signal.get("liquidation"),
-                    leverage=signal.get("leverage", self.leverage),
-                    margin_usdt=signal.get("margin_usdt"),
-                    entry=entry_price,
-                    market=signal.get("market"),
-                    created_at=signal.get("created_at", datetime.now(timezone.utc))
-                )
-                self.db.add_signal(signal_obj)
-            else:
-                logger.error(f"Failed to execute trade for {symbol}")
-                
-        except Exception as e:
-            logger.error(f"Error executing signal for {symbol}: {e}", exc_info=True)
-    
-    def _get_open_trades(self, trading_mode: Optional[str] = None) -> List[Trade]:
-        """Get open trades, optionally filtered by mode"""
-        trades = self.db.get_trades(limit=100)  # Adjust limit as needed
-        open_trades = [t for t in trades if t.status == "open"]
-
-        if trading_mode == "virtual":
-            return [t for t in open_trades if t.virtual]
-        elif trading_mode == "real":
-            return [t for t in open_trades if not t.virtual]
-        
-        return open_trades
-
-    async def _monitor_positions(self, trading_mode: str):
-        """Monitor and manage existing positions"""
-        try:
-            if trading_mode not in ["real", "virtual"]:
-                logger.error(f"Invalid trading mode: {trading_mode}")
+            if not recent_trades:
                 return
             
-            open_trades = self._get_open_trades(trading_mode)
+            ml_filter = MLFilter()
             
-            for trade in open_trades:
+            for trade in recent_trades:
                 try:
-                    await self._check_trade_exit(trade, trading_mode)
-                except Exception as e:
-                    logger.error(f"Error monitoring trade {trade.order_id}: {e}", exc_info=True)
+                    # Create signal dict from trade data
+                    signal = {
+                        'symbol': trade.symbol,
+                        'indicators': trade.indicators or {},
+                        'pnl': trade.pnl or 0
+                    }
                     
+                    # Determine outcome
+                    outcome = (trade.pnl or 0) > 0
+                    
+                    # Update ML model with feedback
+                    ml_filter.update_model_with_feedback(signal, outcome)
+                    
+                except Exception as e:
+                    logger.error(f"Error updating ML feedback for trade {trade.id}: {e}")
+            
+            logger.info(f"Updated ML model with {len(recent_trades)} trade outcomes")
+            
         except Exception as e:
-            logger.error(f"Error monitoring positions: {e}", exc_info=True)
-
-    async def _check_trade_exit(self, trade: Trade, trading_mode: str):
-        """Check if trade should be closed"""
-        try:
-            symbol = trade.symbol
-            current_price = await self._get_price_with_retry(symbol)
-            
-            if current_price <= 0:
-                logger.warning(f"Invalid current price for {symbol}: {current_price}")
-                return
-            
-            entry_price = trade.entry_price
-            side = trade.side.upper()
-            
-            # Calculate current PnL percentage
-            if side in ["BUY", "LONG"]:
-                pnl_pct = (current_price - entry_price) / entry_price * 100
-            else:
-                pnl_pct = (entry_price - current_price) / entry_price * 100
-            
-            # Exit conditions
-            should_exit = False
-            exit_reason = ""
-            
-            # Stop loss (5% loss)
-            if pnl_pct <= -5:
-                should_exit = True
-                exit_reason = "Stop Loss"
-            
-            # Take profit (10% gain)
-            elif pnl_pct >= 10:
-                should_exit = True
-                exit_reason = "Take Profit"
-            
-            # Time-based exit (24 hours)
-            elif trade.timestamp:
-                hours_open = (datetime.now(timezone.utc) - trade.timestamp).total_seconds() / 3600
-                if hours_open >= 24:
-                    should_exit = True
-                    exit_reason = "Time Limit"
-            
-            if should_exit:
-                await self._close_trade(trade, current_price, exit_reason, trading_mode)
-                
-        except Exception as e:
-            logger.error(f"Error checking trade exit for {trade.symbol}: {e}", exc_info=True)
-
-    async def _close_trade(self, trade: Trade, exit_price: float, reason: str, trading_mode: str):
-        """Close a trade"""
-        try:
-            self._ensure_session()  # Ensure session is active
-            trade_dict = asdict(trade)
-            pnl = self.engine.calculate_virtual_pnl(trade_dict)
-            
-            # Update trade in database
-            success = False
-            try:
-                self.db.session.execute(
-                    update(TradeModel)
-                    .where(TradeModel.order_id == trade.order_id)
-                    .values(
-                        status="closed",
-                        exit_price=exit_price,
-                        pnl=pnl,
-                        closed_at=datetime.now(timezone.utc)
-                    )
-                )
-                self.db.session.commit()
-                success = True
-            except Exception as e:
-                self.db.session.rollback()
-                logger.error(f"Database error updating trade {trade.order_id}: {e}", exc_info=True)
-            
-            if success:
-                # Update statistics
-                self.stats["total_pnl"] += pnl
-                if pnl > 0:
-                    self.stats["profitable_trades"] += 1
-                
-                # Update balance
-                self.engine.update_virtual_balances(pnl, mode=trading_mode)
-                
-                logger.info(f"Trade closed: {trade.symbol} {reason} PnL: ${pnl:.2f}, Mode: {trading_mode}")
-            else:
-                logger.error(f"Failed to close trade {trade.order_id}")
-                
-        except Exception as e:
-            logger.error(f"Error closing trade {trade.order_id}: {e}", exc_info=True)
+            logger.error(f"Error updating ML model: {e}")
     
-    def get_performance_summary(self) -> Dict[str, Any]:
-        """Get performance summary"""
+    def get_status(self) -> Dict[str, Any]:
+        """Get current status of automated trader"""
+        return {
+            'running': self.running,
+            'last_scan_time': self.last_scan_time.isoformat() if self.last_scan_time else None,
+            'scan_count': self.scan_count,
+            'total_signals_generated': self.total_signals_generated,
+            'successful_trades': self.successful_trades,
+            'failed_trades': self.failed_trades,
+            'scan_interval': self.scan_interval,
+            'top_n_signals': self.top_n_signals,
+            'auto_trading_enabled': self.auto_trading_enabled,
+            'notification_enabled': self.notification_enabled,
+            'exchange': self.trading_engine.exchange_name
+        }
+    
+    def force_scan(self) -> Dict[str, Any]:
+        """Force an immediate scan (for manual testing)"""
         try:
-            total_trades = self.stats["trades_executed"]
-            profitable_trades = self.stats["profitable_trades"]
+            if not self.running:
+                return {'success': False, 'error': 'Automated trader not running'}
             
-            win_rate = 0
-            avg_pnl = 0
-            if total_trades > 0:
-                win_rate = (profitable_trades / total_trades * 100)
-                avg_pnl = self.stats["total_pnl"] / total_trades
+            logger.info("Force scan initiated")
             
-            runtime = None
-            if self.stats["start_time"]:
-                runtime = datetime.now(timezone.utc) - self.stats["start_time"]
+            # Execute trading cycle in current thread
+            asyncio.run(self._execute_trading_cycle())
             
             return {
-                "total_trades": total_trades,
-                "profitable_trades": profitable_trades,
-                "win_rate": round(win_rate, 1),
-                "total_pnl": round(self.stats["total_pnl"], 2),
-                "avg_pnl": round(avg_pnl, 2),
-                "runtime": str(runtime).split(".")[0] if runtime else "Not started",
-                "signals_generated": self.stats["signals_generated"],
-                "last_scan": self.stats["last_scan"]
+                'success': True,
+                'message': 'Force scan completed',
+                'scan_time': datetime.now(timezone.utc).isoformat()
             }
             
         except Exception as e:
-            logger.error(f"Error getting performance summary: {e}", exc_info=True)
-            return {}
+            logger.error(f"Error in force scan: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    def update_settings(self, new_settings: Dict[str, Any]) -> bool:
+        """Update automated trader settings"""
+        try:
+            if 'scan_interval' in new_settings:
+                self.scan_interval = int(new_settings['scan_interval'])
+            
+            if 'top_n_signals' in new_settings:
+                self.top_n_signals = int(new_settings['top_n_signals'])
+            
+            if 'auto_trading_enabled' in new_settings:
+                self.auto_trading_enabled = bool(new_settings['auto_trading_enabled'])
+            
+            if 'notification_enabled' in new_settings:
+                self.notification_enabled = bool(new_settings['notification_enabled'])
+            
+            logger.info("Automated trader settings updated")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating settings: {e}")
+            return False

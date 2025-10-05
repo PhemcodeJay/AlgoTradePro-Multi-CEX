@@ -3,58 +3,53 @@ from typing import List, Dict, Any
 from datetime import datetime, timezone
 from indicators import scan_multiple_symbols, get_top_symbols
 from ml import MLFilter
-from notification_pdf import send_all_notifications
+from notifications import send_all_notifications
 from db import Signal, db_manager
-
-# Logging using centralized system
 from logging_config import get_logger
+import os
+
 logger = get_logger(__name__)
 
-# -------------------------------
-# Core Signal Utilities
-# -------------------------------
+EXCHANGE = os.getenv("EXCHANGE", "binance").lower()
+TRADING_MODE = os.getenv("TRADING_MODE", "virtual").lower()
 
-async def get_usdt_symbols(limit: int = 50, client=None) -> List[str]:
-    """Fetch USDT-based trading pairs from the exchange using the provided client."""
+# Core Signal Utilities
+
+def get_symbols(limit: int = 50) -> List[str]:
+    """Fetch USDT-based trading pairs without using exchange clients."""
+    # Predefined list of common USDT pairs supported by both Binance and Bybit
+    usdt_symbols = [
+        "BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT",
+        "BNBUSDT", "AVAXUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT",
+        "MATICUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "XLMUSDT"
+    ]
+
+    # Adjust list based on exchange if needed
+    if EXCHANGE == "bybit":
+        # Bybit-specific futures pairs (optional, add if needed)
+        usdt_symbols.extend(["NEARUSDT", "ALGOUSDT", "TRXUSDT"])
+    elif EXCHANGE == "binance":
+        # Binance-specific pairs (optional, add if needed)
+        usdt_symbols.extend(["TRXUSDT", "VETUSDT", "ALGOUSDT"])
+
+    # Remove duplicates and ensure uniqueness
+    usdt_symbols = list(dict.fromkeys(usdt_symbols))
+
+    # Sort by volume using get_top_symbols
     try:
-        if client is None:
-            logger.error("No client provided for get_usdt_symbols")
-            raise ValueError("Exchange client is required to fetch symbols")
-        
-        symbols = []
-        if client.__class__.__name__ == "BinanceClient":
-            # Binance: Fetch exchange info
-            exchange_info = await client.get_exchange_info()
-            for symbol_info in exchange_info.get('symbols', []):
-                symbol = symbol_info['symbol']
-                if symbol.endswith('USDT') and symbol_info['status'] == 'TRADING':
-                    symbols.append(symbol)
-        elif client.__class__.__name__ == "BybitClient":
-            # Bybit: Fetch symbols
-            market_info = await client.get_symbols()
-            for symbol_info in market_info.get('result', []):
-                symbol = symbol_info['name']
-                if symbol.endswith('USDT') and symbol_info.get('status') == 'Trading':
-                    symbols.append(symbol)
-        else:
-            logger.error(f"Unsupported client type: {client.__class__.__name__}")
-            raise ValueError(f"Unsupported client: {client.__class__.__name__}")
-        
-        if not symbols:
-            logger.warning("No USDT symbols from API, using fallback list")
-            symbols = ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"]
-        
-        # Sort by trading volume or use get_top_symbols if available
-        try:
-            top_symbols = get_top_symbols(limit)
-            symbols = [s for s in top_symbols if s in symbols]
-        except Exception as e:
-            logger.warning(f"Error sorting symbols by volume: {e}")
-        
-        return symbols[:limit]
+        top_symbols = get_top_symbols(limit)
+        usdt_symbols = [s for s in top_symbols if s in usdt_symbols][:limit]
     except Exception as e:
-        logger.error(f"Error fetching USDT symbols for {client.__class__.__name__}: {e}")
-        return ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"]
+        logger.warning(f"Error sorting symbols by volume: {e}")
+        # If get_top_symbols fails, return unsorted list truncated to limit
+        usdt_symbols = usdt_symbols[:limit]
+
+    if not usdt_symbols:
+        logger.warning("No USDT symbols available, using fallback list")
+        usdt_symbols = ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"]
+
+    logger.info(f"Retrieved {len(usdt_symbols)} USDT trading pairs for {EXCHANGE}")
+    return sorted(usdt_symbols)
 
 def calculate_signal_score(analysis: Dict[str, Any]) -> float:
     """Calculate a score for a trading signal based on indicators"""
@@ -101,117 +96,72 @@ def enhance_signal(analysis: Dict[str, Any]) -> Dict[str, Any]:
     if side.lower() == "buy":
         sl = price - atr * atr_multiplier
         tp = price + atr * atr_multiplier * risk_reward
-        liq = price * (1 - 0.9 / leverage)
+        liquidation = price * (1 - 0.9 / leverage)
+        trail = atr * 1.5
     else:
         sl = price + atr * atr_multiplier
         tp = price - atr * atr_multiplier * risk_reward
-        liq = price * (1 + 0.9 / leverage)
+        liquidation = price * (1 + 0.9 / leverage)
+        trail = -atr * 1.5
 
-    trail = atr
-    margin_usdt = 5.0
-
-    bb_upper = indicators.get("bb_upper", 0)
-    bb_lower = indicators.get("bb_lower", 0)
-    bb_slope = "Expanding" if bb_upper - bb_lower > price * 0.02 else "Contracting"
-
-    vol = indicators.get("volatility", 0)
-    if vol < 1:
-        market_type = "Low Vol"
-    elif vol < 3:
-        market_type = "Normal"
-    else:
-        market_type = "High Vol"
+    margin_usdt = price * 1 / leverage  # Dummy qty=1
 
     enhanced = analysis.copy()
     enhanced.update({
-        "entry": round(price, 6),
-        "sl": round(sl, 6),
-        "tp": round(tp, 6),
-        "trail": round(trail, 6),
-        "liquidation": round(liq, 6),
-        "margin_usdt": round(margin_usdt, 6),
-        "bb_slope": bb_slope,
-        "market": market_type,
-        "leverage": leverage,
-        "risk_reward": risk_reward,
-        "atr_multiplier": atr_multiplier,
-        "created_at": datetime.now(timezone.utc)
+        'entry': price,
+        'sl': sl,
+        'tp': tp,
+        'trail': trail,
+        'liquidation': liquidation,
+        'leverage': leverage,
+        'margin_usdt': margin_usdt,
+        'market': 'futures',
+        'created_at': datetime.now(timezone.utc)
     })
     return enhanced
 
-# -------------------------------
-# Signal Generation
-# -------------------------------
-
-async def generate_signals(
-    symbols: List[str],
-    interval: str = "60",
-    top_n: int = 10,
-    trading_mode: str = "virtual",
-    client=None
-) -> List[Dict[str, Any]]:
-    """Generate trading signals for given symbols"""
-    logger.info(f"Generating signals for {len(symbols)} symbols in {trading_mode} mode")
-    raw_analyses: List[Dict[str, Any]] = scan_multiple_symbols(symbols, interval, max_workers=5)  # Removed await
-    if not raw_analyses:
-        logger.warning("No analysis results")
-        return []
-
-    scored_signals = []
+def generate_signals(symbols: List[str], interval: str = "60", top_n: int = 5, threshold: float = 0.6) -> List[Dict[str, Any]]:
+    """Generate and filter signals"""
+    raw_analyses = scan_multiple_symbols(symbols, interval)
+    
+    scored = []
     for analysis in raw_analyses:
-        score = calculate_signal_score(analysis)
-        analysis["score"] = score
-        min_score = 50 if trading_mode == "real" else 40
-        if score >= min_score:
-            scored_signals.append(analysis)
-
-    if not scored_signals:
-        logger.info("No significant signals found after scoring")
-        return []
-
-    # ML filtering
+        analysis['score'] = calculate_signal_score(analysis)
+        scored.append(analysis)
+    
+    scored.sort(key=lambda x: x['score'], reverse=True)
+    top = scored[:top_n]
+    
+    enhanced = [enhance_signal(a) for a in top]
+    
     ml_filter = MLFilter()
-    try:
-        filtered_signals = ml_filter.filter_signals(scored_signals)
-    except Exception as e:
-        logger.warning(f"ML filter failed: {e}")
-        filtered_signals = scored_signals
-
-    # Enhance and store signals
-    final_signals = []
-    for s in filtered_signals[:top_n]:
-        enhanced = enhance_signal(s)
-        final_signals.append(enhanced)
-
-        # Save to DB
+    filtered = ml_filter.filter_signals(enhanced, threshold=threshold)
+    
+    # Save to DB with exchange
+    for f in filtered:
         signal_obj = Signal(
-            symbol=str(enhanced.get("symbol") or "UNKNOWN"),
+            symbol=str(f.get("symbol") or "UNKNOWN"),
             interval=interval,
-            signal_type=str(enhanced.get("signal_type", "BUY")),
-            score=float(enhanced.get("score", 0)),
-            indicators=enhanced.get("indicators", {}),
-            side=str(enhanced.get("side", "BUY")),
-            sl=float(enhanced.get("sl") or 0),
-            tp=float(enhanced.get("tp") or 0),
-            trail=float(enhanced.get("trail") or 0),
-            liquidation=float(enhanced.get("liquidation") or 0),
-            leverage=int(enhanced.get("leverage", 10)),
-            margin_usdt=float(enhanced.get("margin_usdt") or 0),
-            entry=float(enhanced.get("entry") or 0),
-            market=str(enhanced.get("market", "Unknown")),
-            created_at=enhanced.get("created_at") or datetime.now(timezone.utc)
+            signal_type=str(f.get("signal_type", "BUY")),
+            side=str(f.get("side", "BUY")),
+            score=float(f.get("score", 0)),
+            entry=float(f.get("entry") or 0),
+            sl=float(f.get("sl") or 0),
+            tp=float(f.get("tp") or 0),
+            trail=float(f.get("trail") or 0),
+            liquidation=float(f.get("liquidation") or 0),
+            leverage=int(f.get("leverage", 10)),
+            margin_usdt=float(f.get("margin_usdt") or 0),
+            market=str(f.get("market", "Unknown")),
+            indicators=f.get("indicators", {}),
+            exchange=EXCHANGE,
+            created_at=f.get("created_at") or datetime.now(timezone.utc)
         )
+        db_manager.add_signal(signal_obj)
+    
+    return filtered
 
-        try:
-            db_manager.add_signal(signal_obj)
-        except Exception as e:
-            logger.error(f"Failed to save signal {enhanced.get('symbol')} to DB: {e}")
-
-    return final_signals
-
-# -------------------------------
 # Signal Summary
-# -------------------------------
 
 def get_signal_summary(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Summarize signal statistics"""
@@ -239,9 +189,9 @@ def get_signal_summary(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
         "market_distribution": market_types
     }
 
-async def analyze_single_symbol(symbol: str, interval: str = "60", client=None) -> Dict[str, Any]:
+def analyze_single_symbol(symbol: str, interval: str = "60") -> Dict[str, Any]:
     """Analyze a single symbol and return the enhanced signal dictionary"""
-    raw_analyses: List[Dict[str, Any]] = scan_multiple_symbols([symbol], interval, max_workers=1)  # Removed await
+    raw_analyses = scan_multiple_symbols([symbol], interval)
     if not raw_analyses:
         logger.warning(f"No analysis found for {symbol}")
         return {}
@@ -249,53 +199,39 @@ async def analyze_single_symbol(symbol: str, interval: str = "60", client=None) 
     analysis = raw_analyses[0]
     analysis["score"] = calculate_signal_score(analysis)
     enhanced = enhance_signal(analysis)
-
-    # Save to DB
+    
+    # Save to DB with exchange
     signal_obj = Signal(
         symbol=str(enhanced.get("symbol") or "UNKNOWN"),
         interval=interval,
         signal_type=str(enhanced.get("signal_type", "BUY")),
-        score=float(enhanced.get("score", 0)),
-        indicators=enhanced.get("indicators", {}),
         side=str(enhanced.get("side", "BUY")),
+        score=float(enhanced.get("score", 0)),
+        entry=float(enhanced.get("entry") or 0),
         sl=float(enhanced.get("sl") or 0),
         tp=float(enhanced.get("tp") or 0),
         trail=float(enhanced.get("trail") or 0),
         liquidation=float(enhanced.get("liquidation") or 0),
         leverage=int(enhanced.get("leverage", 10)),
         margin_usdt=float(enhanced.get("margin_usdt") or 0),
-        entry=float(enhanced.get("entry") or 0),
         market=str(enhanced.get("market", "Unknown")),
+        indicators=enhanced.get("indicators", {}),
+        exchange=EXCHANGE,
         created_at=enhanced.get("created_at") or datetime.now(timezone.utc)
     )
-
-    try:
-        db_manager.add_signal(signal_obj)
-    except Exception as e:
-        logger.error(f"Failed to save signal {enhanced.get('symbol')} to DB: {e}")
+    db_manager.add_signal(signal_obj)
 
     return enhanced
 
-# -------------------------------
 # Run Standalone
-# -------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    import asyncio
+    
+    # For standalone testing
+    symbols = get_symbols(limit=20)
+    signals = generate_signals(symbols, interval="60", top_n=5)
+    summary = get_signal_summary(signals)
+    logger.info(f"Signal Summary: {summary}")
 
-    async def main():
-        # For standalone testing, create a dummy client
-        class DummyClient:
-            async def get_exchange_info(self):
-                return {"symbols": [{"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT"}]}
-
-        client = DummyClient()
-        symbols = await get_usdt_symbols(limit=20, client=client)
-        signals = await generate_signals(symbols, interval="60", top_n=5, client=client)
-        summary = get_signal_summary(signals)
-        logger.info(f"Signal Summary: {summary}")
-
-        if signals:
-            send_all_notifications(signals)
-
-    asyncio.run(main())
+    if signals:
+        send_all_notifications(signals)
