@@ -1,3 +1,4 @@
+# indicators.py (fixed data fetching issues, removed env dependency, pass exchange param)
 import ccxt
 import pandas as pd
 import numpy as np
@@ -11,26 +12,26 @@ from bybit_client import BybitClient
 
 logger = get_logger(__name__)
 
-# Exchange setup
-EXCHANGE = os.getenv("EXCHANGE", "binance").lower()
+# TRADING_MODE kept for logging (not critical for exchange)
 TRADING_MODE = os.getenv("TRADING_MODE", "virtual").lower()  # Used for logging, but data is always real
 
-def get_client() -> Any:
+def get_client(exchange: str) -> Any:
     """Get the appropriate client based on exchange"""
-    if EXCHANGE == "binance":
+    exchange = exchange.lower()
+    if exchange == "binance":
         return BinanceClient()
-    elif EXCHANGE == "bybit":
+    elif exchange == "bybit":
         return BybitClient()
     else:
-        raise ValueError(f"Unsupported exchange: {EXCHANGE}")
+        raise ValueError(f"Unsupported exchange: {exchange}")
 
-def get_top_symbols(limit: int = 50) -> List[str]:
+def get_top_symbols(exchange: str, limit: int = 50) -> List[str]:
     """Get top USDT trading pairs by volume using custom client"""
     try:
-        client = get_client()
+        client = get_client(exchange)
         # Use underlying CCXT exchange for tickers
-        exchange = client.exchange
-        tickers = exchange.fetch_tickers()
+        exchange_client = client.exchange
+        tickers = exchange_client.fetch_tickers()
         
         # Filter USDT pairs
         usdt_pairs = {symbol: ticker for symbol, ticker in tickers.items() 
@@ -43,18 +44,18 @@ def get_top_symbols(limit: int = 50) -> List[str]:
         # Convert to symbol format (remove /USDT)
         symbols = [symbol.replace('/USDT', 'USDT') for symbol, _ in sorted_pairs[:limit]]
         
-        logger.info(f"Fetched top {len(symbols)} USDT symbols from {EXCHANGE}")
+        logger.info(f"Fetched top {len(symbols)} USDT symbols from {exchange}")
         return symbols
         
     except Exception as e:
-        logger.error(f"Error fetching top symbols from {EXCHANGE}: {e}")
+        logger.error(f"Error fetching top symbols from {exchange}: {e}")
         # Fallback symbols
         return ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"]
 
-def fetch_klines(symbol: str, timeframe: str = '1h', limit: int = 500) -> Optional[pd.DataFrame]:
+def fetch_klines(exchange: str, symbol: str, timeframe: str = '1h', limit: int = 500) -> Optional[pd.DataFrame]:
     """Fetch klines/candles for a symbol using custom client"""
     try:
-        client = get_client()
+        client = get_client(exchange)
         
         # Convert timeframe if needed
         if timeframe == '60':
@@ -142,10 +143,10 @@ def calculate_volume_ratio(df: pd.DataFrame, short_period: int = 5, long_period:
     vol_long = df['volume'].rolling(window=long_period).mean()
     return vol_short / vol_long
 
-def analyze_symbol(symbol: str, timeframe: str = '1h') -> Dict[str, Any]:
+def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Dict[str, Any]:
     """Analyze a single symbol"""
     try:
-        df = fetch_klines(symbol, timeframe)
+        df = fetch_klines(exchange, symbol, timeframe)
         if df is None or len(df) < 100:
             logger.warning(f"Insufficient data for {symbol}")
             return {}
@@ -250,13 +251,13 @@ def analyze_symbol(symbol: str, timeframe: str = '1h') -> Dict[str, Any]:
         logger.error(f"Error analyzing {symbol}: {e}")
         return {}
 
-def scan_multiple_symbols(symbols: List[str], timeframe: str = '1h', max_workers: int = 5) -> List[Dict[str, Any]]:
+def scan_multiple_symbols(exchange: str, symbols: List[str], timeframe: str = '1h', max_workers: int = 5) -> List[Dict[str, Any]]:
     """Scan multiple symbols in parallel"""
     results = []
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_symbol = {
-            executor.submit(analyze_symbol, symbol, timeframe): symbol 
+            executor.submit(analyze_symbol, exchange, symbol, timeframe): symbol 
             for symbol in symbols
         }
         
@@ -274,14 +275,14 @@ def scan_multiple_symbols(symbols: List[str], timeframe: str = '1h', max_workers
     logger.info(f"Analyzed {len(results)}/{len(symbols)} symbols")
     return results
 
-def get_market_overview() -> Dict[str, Any]:
+def get_market_overview(exchange: str) -> Dict[str, Any]:
     """Get general market overview"""
     try:
-        client = get_client()
-        exchange = client.exchange
+        client = get_client(exchange)
+        exchange_client = client.exchange
         
-        btc_ticker = exchange.fetch_ticker('BTC/USDT')
-        eth_ticker = exchange.fetch_ticker('ETH/USDT')
+        btc_ticker = exchange_client.fetch_ticker('BTC/USDT')
+        eth_ticker = exchange_client.fetch_ticker('ETH/USDT')
         
         return {
             'btc_price': btc_ticker['last'],
@@ -297,8 +298,9 @@ def get_market_overview() -> Dict[str, Any]:
 
 if __name__ == "__main__":
     # Test the indicators
-    symbols = get_top_symbols(5)
-    results = scan_multiple_symbols(symbols)
+    exchange = "binance"  # Default for standalone testing
+    symbols = get_top_symbols(exchange, 5)
+    results = scan_multiple_symbols(exchange, symbols)
     
     for result in results:
         print(f"{result['symbol']}: Score {result['score']}, Side: {result['side']}")

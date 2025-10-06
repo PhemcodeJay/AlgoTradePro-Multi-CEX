@@ -1,3 +1,4 @@
+# automated_trader.py (modified to pass exchange to signal_generator functions)
 import asyncio
 import time
 import threading
@@ -113,13 +114,13 @@ class AutomatedTrader:
             self.last_scan_time = datetime.now(timezone.utc)
             
             # Get USDT symbols
-            symbols = get_symbols(limit=50)
+            symbols = get_symbols(self.trading_engine.exchange_name, limit=50)
             if not symbols:
                 logger.warning("No symbols retrieved for trading")
                 return
             
             # Generate signals
-            signals = generate_signals(symbols, interval="60", top_n=self.top_n_signals)
+            signals = generate_signals(self.trading_engine.exchange_name, symbols, interval="60", top_n=self.top_n_signals)
             self.total_signals_generated += len(signals)
             
             # Log signal summary

@@ -1,3 +1,4 @@
+# signal_generator.py (removed env dependency, pass exchange param)
 import logging
 from typing import List, Dict, Any
 from datetime import datetime, timezone
@@ -10,12 +11,11 @@ import os
 
 logger = get_logger(__name__)
 
-EXCHANGE = os.getenv("EXCHANGE", "binance").lower()
 TRADING_MODE = os.getenv("TRADING_MODE", "virtual").lower()
 
 # Core Signal Utilities
 
-def get_symbols(limit: int = 50) -> List[str]:
+def get_symbols(exchange: str, limit: int = 50) -> List[str]:
     """Fetch USDT-based trading pairs without using exchange clients."""
     # Predefined list of common USDT pairs supported by both Binance and Bybit
     usdt_symbols = [
@@ -25,10 +25,10 @@ def get_symbols(limit: int = 50) -> List[str]:
     ]
 
     # Adjust list based on exchange if needed
-    if EXCHANGE == "bybit":
+    if exchange == "bybit":
         # Bybit-specific futures pairs (optional, add if needed)
         usdt_symbols.extend(["NEARUSDT", "ALGOUSDT", "TRXUSDT"])
-    elif EXCHANGE == "binance":
+    elif exchange == "binance":
         # Binance-specific pairs (optional, add if needed)
         usdt_symbols.extend(["TRXUSDT", "VETUSDT", "ALGOUSDT"])
 
@@ -37,7 +37,7 @@ def get_symbols(limit: int = 50) -> List[str]:
 
     # Sort by volume using get_top_symbols
     try:
-        top_symbols = get_top_symbols(limit)
+        top_symbols = get_top_symbols(exchange, limit)
         usdt_symbols = [s for s in top_symbols if s in usdt_symbols][:limit]
     except Exception as e:
         logger.warning(f"Error sorting symbols by volume: {e}")
@@ -48,7 +48,7 @@ def get_symbols(limit: int = 50) -> List[str]:
         logger.warning("No USDT symbols available, using fallback list")
         usdt_symbols = ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"]
 
-    logger.info(f"Retrieved {len(usdt_symbols)} USDT trading pairs for {EXCHANGE}")
+    logger.info(f"Retrieved {len(usdt_symbols)} USDT trading pairs for {exchange}")
     return sorted(usdt_symbols)
 
 def calculate_signal_score(analysis: Dict[str, Any]) -> float:
@@ -120,9 +120,9 @@ def enhance_signal(analysis: Dict[str, Any]) -> Dict[str, Any]:
     })
     return enhanced
 
-def generate_signals(symbols: List[str], interval: str = "60", top_n: int = 5, threshold: float = 0.6) -> List[Dict[str, Any]]:
+def generate_signals(exchange: str, symbols: List[str], interval: str = "60", top_n: int = 5, threshold: float = 0.6) -> List[Dict[str, Any]]:
     """Generate and filter signals"""
-    raw_analyses = scan_multiple_symbols(symbols, interval)
+    raw_analyses = scan_multiple_symbols(exchange, symbols, interval)
     
     scored = []
     for analysis in raw_analyses:
@@ -154,7 +154,7 @@ def generate_signals(symbols: List[str], interval: str = "60", top_n: int = 5, t
             margin_usdt=float(f.get("margin_usdt") or 0),
             market=str(f.get("market", "Unknown")),
             indicators=f.get("indicators", {}),
-            exchange=EXCHANGE,
+            exchange=exchange,
             created_at=f.get("created_at") or datetime.now(timezone.utc)
         )
         db_manager.add_signal(signal_obj)
@@ -189,9 +189,9 @@ def get_signal_summary(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
         "market_distribution": market_types
     }
 
-def analyze_single_symbol(symbol: str, interval: str = "60") -> Dict[str, Any]:
+def analyze_single_symbol(exchange: str, symbol: str, interval: str = "60") -> Dict[str, Any]:
     """Analyze a single symbol and return the enhanced signal dictionary"""
-    raw_analyses = scan_multiple_symbols([symbol], interval)
+    raw_analyses = scan_multiple_symbols(exchange, [symbol], interval)
     if not raw_analyses:
         logger.warning(f"No analysis found for {symbol}")
         return {}
@@ -216,7 +216,7 @@ def analyze_single_symbol(symbol: str, interval: str = "60") -> Dict[str, Any]:
         margin_usdt=float(enhanced.get("margin_usdt") or 0),
         market=str(enhanced.get("market", "Unknown")),
         indicators=enhanced.get("indicators", {}),
-        exchange=EXCHANGE,
+        exchange=exchange,
         created_at=enhanced.get("created_at") or datetime.now(timezone.utc)
     )
     db_manager.add_signal(signal_obj)
@@ -228,8 +228,9 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     
     # For standalone testing
-    symbols = get_symbols(limit=20)
-    signals = generate_signals(symbols, interval="60", top_n=5)
+    exchange = "binance"  # Default for standalone testing
+    symbols = get_symbols(exchange, limit=20)
+    signals = generate_signals(exchange, symbols, interval="60", top_n=5)
     summary = get_signal_summary(signals)
     logger.info(f"Signal Summary: {summary}")
 

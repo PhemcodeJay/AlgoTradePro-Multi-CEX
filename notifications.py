@@ -1,3 +1,4 @@
+# notifications.py
 import os
 import time
 import webbrowser
@@ -5,15 +6,15 @@ from fpdf import FPDF
 from typing import List, Dict, Any, Optional
 import requests
 import urllib.parse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv()
 
-tz_utc3 = timezone(timedelta(hours=3))
-
 # Logging using centralized system
 from logging_config import get_logger
+from settings import load_settings  # Import settings to get notification limits
+
 logger = get_logger(__name__)
 
 # Config
@@ -21,6 +22,12 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 WHATSAPP_NUMBER = os.getenv("WHATSAPP_TO", "")
+
+# Load settings for notification limits
+SETTINGS = load_settings()
+DISCORD_SIGNAL_LIMIT = int(SETTINGS.get("DISCORD_SIGNAL_LIMIT", 5))
+TELEGRAM_SIGNAL_LIMIT = int(SETTINGS.get("TELEGRAM_SIGNAL_LIMIT", 5))
+WHATSAPP_SIGNAL_LIMIT = int(SETTINGS.get("WHATSAPP_SIGNAL_LIMIT", 3))
 
 # PDF Helper
 class SignalPDF(FPDF):
@@ -43,33 +50,39 @@ class SignalPDF(FPDF):
             # Signal header
             self.set_font("Arial", "B", 10)
             self.set_text_color(0, 0, 0)
-            symbol = s.get('symbol', s.get('Symbol', 'N/A'))
-            self.cell(0, 6, f"Signal #{i+1}: {symbol}", ln=1)
+            symbol = s.get('symbol', 'N/A')
+            exchange = s.get('exchange', 'N/A').capitalize()
+            self.cell(0, 6, f"Signal #{i+1}: {symbol} ({exchange})", ln=1)
             
             # Signal details
             self.set_font("Arial", "", 9)
             self.set_text_color(50, 50, 50)
             
-            signal_type = s.get('signal_type', s.get('Type', 'N/A'))
-            side = s.get('side', s.get('Side', 'N/A'))
-            score = s.get('score', s.get('Score', 'N/A'))
-            entry = s.get('entry', s.get('Entry', 'N/A'))
-            tp = s.get('tp', s.get('TP', 'N/A'))
-            sl = s.get('sl', s.get('SL', 'N/A'))
-            market = s.get('market', s.get('Market', 'N/A'))
-            bb_slope = s.get('bb_slope', s.get('BB Slope', 'N/A'))
-            trail = s.get('trail', s.get('Trail', 'N/A'))
-            margin = s.get('margin_usdt', s.get('Margin', 'N/A'))
-            liq = s.get('liquidation', s.get('Liq', 'N/A'))
+            signal_type = s.get('signal_type', 'N/A')
+            side = s.get('side', 'N/A')
+            score = s.get('score', 'N/A')
+            entry = s.get('entry', 'N/A')
+            tp = s.get('tp', 'N/A')
+            sl = s.get('sl', 'N/A')
+            market = s.get('market', 'N/A')
+            trend_score = s.get('indicators', {}).get('trend_score', 'N/A')
+            trail = s.get('trail', 'N/A')
+            margin = s.get('margin_usdt', 'N/A')
+            liq = s.get('liquidation', 'N/A')
             
-            created_at = s.get('created_at', s.get('Time', 'N/A'))
+            created_at = s.get('created_at', datetime.now(timezone.utc))
             if isinstance(created_at, datetime):
-                created_at = created_at.strftime('%Y-%m-%d %H:%M:%S')
+                created_at = created_at.strftime('%Y-%m-%d %H:%M:%S %Z')
+            else:
+                try:
+                    created_at = datetime.fromisoformat(str(created_at).replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M:%S %Z')
+                except:
+                    created_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')
             
             details = [
                 f"Type: {signal_type} | Side: {side} | Score: {score}%",
                 f"Entry: {entry} | TP: {tp} | SL: {sl}",
-                f"Market: {market} | BB: {bb_slope} | Trail: {trail}",
+                f"Market: {market} | Trend Score: {trend_score} | Trail: {trail}",
                 f"Margin: {margin} | Liq: {liq} | Time: {created_at}"
             ]
             
@@ -90,54 +103,50 @@ def generate_pdf_bytes(signals: List[Dict[str, Any]]) -> bytes:
         pdf = SignalPDF()
         pdf.add_page()
         pdf.add_signals(signals[:25])  # Limit to 25 signals per PDF
-        
         pdf_output = pdf.output(dest='S')
         if isinstance(pdf_output, str):
             return pdf_output.encode('latin-1')
         return pdf_output
-            
     except Exception as e:
-        logger.error(f"Error generating PDF: {e}")
+        logger.error(f"Error generating PDF: {e}", exc_info=True)
         return b""
 
 def format_signal_block(signal: Dict[str, Any]) -> str:
     """Format a single signal for human-readable notification (Markdown style)"""
     try:
-        symbol = signal.get("symbol", signal.get("Symbol", "Unknown"))
-        market = signal.get("market", signal.get("Market", "Normal"))
-        side = str(signal.get("side", signal.get("Side", "Buy"))).upper()
-        score = float(signal.get("score", signal.get("Score", 0)))
-        entry = float(signal.get("entry", signal.get("Entry", 0)))
-        tp = float(signal.get("tp", signal.get("TP", 0)))
-        sl = float(signal.get("sl", signal.get("SL", 0)))
-        trail = float(signal.get("trail", signal.get("Trail", 0)))
-        margin = float(signal.get("margin_usdt", signal.get("Margin", 5)))
-        liquidation = float(signal.get("liquidation", signal.get("Liq", 0)))
-        bb_slope = signal.get("bb_slope", signal.get("BB Slope", "Unknown"))
+        symbol = signal.get("symbol", "Unknown")
+        exchange = signal.get("exchange", "Unknown").capitalize()
+        market = signal.get("market", "Normal")
+        side = str(signal.get("side", "Buy")).upper()
+        score = float(signal.get("score", 0))
+        entry = float(signal.get("entry", 0))
+        tp = float(signal.get("tp", 0))
+        sl = float(signal.get("sl", 0))
+        trail = float(signal.get("trail", 0))
+        margin = float(signal.get("margin_usdt", 5))
+        liquidation = float(signal.get("liquidation", 0))
+        trend_score = float(signal.get("indicators", {}).get("trend_score", 0))
 
-        # Fix: convert datetime to timestamp if necessary
-        created_at_val = signal.get("created_at", time.time())
-        if isinstance(created_at_val, datetime):
-            created_at_val = created_at_val.timestamp()
-        elif isinstance(created_at_val, str):
+        created_at = signal.get("created_at", datetime.now(timezone.utc))
+        if isinstance(created_at, datetime):
+            created_at_str = created_at.strftime("%Y-%m-%d %H:%M:%S %Z")
+        else:
             try:
-                created_at_val = datetime.fromisoformat(created_at_val.replace('Z', '+00:00')).timestamp()
+                created_at_str = datetime.fromisoformat(str(created_at).replace('Z', '+00:00')).strftime("%Y-%m-%d %H:%M:%S %Z")
             except:
-                created_at_val = time.time()
-
-        created_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created_at_val))
+                created_at_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
         return (
-            f"💹 **{symbol}** - {market} Market\n"
+            f"💹 **{symbol}** ({exchange}) - {market} Market\n"
             f"🔹 **{side}** Signal | Score: **{score:.1f}%**\n"
             f"🔹 Entry: **${entry:.6f}** | TP: **${tp:.6f}** | SL: **${sl:.6f}**\n"
-            f"🔹 BB Slope: {bb_slope} | Trail: ${trail:.6f}\n"
+            f"🔹 Trend Score: {trend_score:.2f} | Trail: ${trail:.6f}\n"
             f"🔹 Margin: ${margin:.6f} | Liquidation: ${liquidation:.6f}\n"
-            f"🔹 Generated: {created_at}\n"
+            f"🔹 Generated: {created_at_str}\n"
         )
-    except Exception as e:
-        logger.error(f"Error formatting signal block: {e}")
-        return f"💹 Signal formatting error: {str(e)}\n"
+    except (ValueError, TypeError) as e:
+        logger.error(f"Error formatting signal block: {e}", exc_info=True)
+        return f"💹 Signal formatting error for {signal.get('symbol', 'Unknown')}: {str(e)}\n"
 
 def send_whatsapp(signals: List[Dict[str, Any]], to_number: Optional[str] = None):
     """Open WhatsApp Web with trading signals ready to send"""
@@ -153,12 +162,12 @@ def send_whatsapp(signals: List[Dict[str, Any]], to_number: Optional[str] = None
         return
     
     try:
-        signal_blocks = [format_signal_block(s) for s in signals[:3]]
+        signal_blocks = [format_signal_block(s) for s in signals[:WHATSAPP_SIGNAL_LIMIT]]
         message_header = f"🚀 AlgoTrader Pro - {len(signals)} Signals Generated\n\n"
         message = message_header + "\n".join(signal_blocks)
         
-        if len(signals) > 3:
-            message += f"\n\n📊 {len(signals) - 3} more signals available in the app"
+        if len(signals) > WHATSAPP_SIGNAL_LIMIT:
+            message += f"\n\n📊 {len(signals) - WHATSAPP_SIGNAL_LIMIT} more signals available in the app"
         
         # Clean up message for WhatsApp (remove markdown)
         message = message.replace("**", "")
@@ -167,7 +176,6 @@ def send_whatsapp(signals: List[Dict[str, Any]], to_number: Optional[str] = None
         whatsapp_url = f"https://wa.me/{to_number}?text={encoded_message}"
         webbrowser.open(whatsapp_url)
         logger.info(f"WhatsApp message prepared for {to_number}")
-        
     except Exception as e:
         logger.error(f"WhatsApp error: {e}", exc_info=True)
 
@@ -182,7 +190,7 @@ def send_discord(signals: List[Dict[str, Any]]):
         return
     
     try:
-        signal_blocks = [format_signal_block(s) for s in signals[:5]]
+        signal_blocks = [format_signal_block(s) for s in signals[:DISCORD_SIGNAL_LIMIT]]
         message = f"🎯 **AlgoTrader Pro - Top {len(signal_blocks)} Trading Signals**\n\n" + "\n".join(signal_blocks)
         
         # Discord has 2000 char limit
@@ -200,7 +208,6 @@ def send_discord(signals: List[Dict[str, Any]]):
             pdf_response = requests.post(DISCORD_WEBHOOK_URL, files=files, timeout=15)
             pdf_response.raise_for_status()
             logger.info("Discord PDF attachment sent successfully")
-        
     except requests.exceptions.RequestException as e:
         logger.error(f"Discord HTTP error: {e}", exc_info=True)
     except Exception as e:
@@ -217,7 +224,7 @@ def send_telegram(signals: List[Dict[str, Any]]):
         return
     
     try:
-        signal_blocks = [format_signal_block(s) for s in signals[:5]]
+        signal_blocks = [format_signal_block(s) for s in signals[:TELEGRAM_SIGNAL_LIMIT]]
         message = f"🎯 *AlgoTrader Pro - Top {len(signal_blocks)} Trading Signals*\n\n" + "\n".join(signal_blocks)
         
         # Telegram has 4096 char limit
@@ -242,7 +249,6 @@ def send_telegram(signals: List[Dict[str, Any]]):
             pdf_response = requests.post(doc_url, data=data, files=files, timeout=15)
             pdf_response.raise_for_status()
             logger.info("Telegram PDF attachment sent successfully")
-        
     except requests.exceptions.RequestException as e:
         logger.error(f"Telegram HTTP error: {e}", exc_info=True)
     except Exception as e:
@@ -276,19 +282,20 @@ def send_all_notifications(signals: List[Dict[str, Any]]):
 def test_notifications():
     """Test notification system with sample signal"""
     test_signal = {
-        'Symbol': 'BTCUSDT',
-        'Type': 'Buy',
-        'Side': 'LONG',
-        'Score': '85.5',
-        'Entry': 45000.00,
-        'TP': 46500.00,
-        'SL': 44000.00,
-        'Market': 'High Vol',
-        'BB Slope': 'Expanding',
-        'Trail': 250.00,
-        'Margin': 150.00,
-        'Liq': 40500.00,
-        'Time': '2024-01-15 10:30:00'
+        'symbol': 'BTCUSDT',
+        'exchange': 'binance',
+        'signal_type': 'bullish',
+        'side': 'BUY',
+        'score': 85.5,
+        'entry': 45000.00,
+        'tp': 46500.00,
+        'sl': 44000.00,
+        'market': 'futures',
+        'trail': 250.00,
+        'margin_usdt': 150.00,
+        'liquidation': 40500.00,
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'indicators': {'trend_score': 1.0}
     }
     
     logger.info("Testing notification system...")
