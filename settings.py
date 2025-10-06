@@ -94,7 +94,7 @@ def load_settings() -> Dict[str, Any]:
                             logger.warning(f"Invalid {key} {settings[key]}, using default {value}")
                             settings[key] = value
                     # Merge exchange-specific settings
-                    if key in ["binance", "bybit"]:
+                    if key in ["binance", "bybit"] and isinstance(value, dict):  # Added isinstance check
                         for sub_key, sub_value in value.items():
                             if sub_key not in settings[key]:
                                 logger.warning(f"Missing {key}.{sub_key} in {SETTINGS_FILE}, using default {sub_value}")
