@@ -1,5 +1,5 @@
 {
-  "EXCHANGE": "bybit",
+  "EXCHANGE": "binance",
   "SCAN_INTERVAL": 3600.0,
   "TOP_N_SIGNALS": 10,
   "MAX_LOSS_PCT": -15.0,

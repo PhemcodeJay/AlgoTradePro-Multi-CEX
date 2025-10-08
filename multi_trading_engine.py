@@ -345,6 +345,8 @@ class TradingEngine:
                 return False
 
             if TRADING_MODE == "virtual":
+                # If virtual mode, update capital and execute virtual trade
+                self._update_capital_json("virtual", qty * entry_price)
                 return self.execute_virtual_trade(signal)
 
             # Create trade entry in database
@@ -366,6 +368,9 @@ class TradingEngine:
             )
             self.db.add_trade(trade)
             self.db.session.commit()
+
+            # Update capital for real trades
+            self._update_capital_json("real", qty * entry_price)
 
             max_retries = 3
             for attempt in range(max_retries):
@@ -472,6 +477,8 @@ class TradingEngine:
         """Get account balance"""
         try:
             if TRADING_MODE == "virtual":
+                # This is a simplified representation for virtual mode.
+                # In a real scenario, this would fetch from a virtual balance store.
                 trades = self.db.get_trades(exchange=self.exchange_name, status="open") or []
                 total_pnl = sum(to_float(getattr(t, "pnl", 0)) for t in trades)
                 initial_balance = to_float(self.settings.get("VIRTUAL_BALANCE", 10000.0))
@@ -555,7 +562,7 @@ class TradingEngine:
                 "entry_price": getattr(trade, "entry_price", 0),
                 "qty": getattr(trade, "qty", 0),
                 "side": getattr(trade, "side", "BUY")
-            })
+            }, exit_price) # Pass exit_price here
 
             # Update trade
             updates = {
@@ -574,14 +581,16 @@ class TradingEngine:
             logger.error(f"Error closing virtual trade: {e}")
             return False
 
-    def calculate_virtual_pnl(self, trade: Dict[str, Any]) -> float:
+    def calculate_virtual_pnl(self, trade: Dict[str, Any], exit_price: Optional[float] = None) -> float:
         """Calculate PnL for a virtual trade"""
         try:
             symbol = trade.get("symbol", '').replace('/', '')
             entry_price = to_float(trade.get("entry_price", 0))
             qty = to_float(trade.get("qty", 0))
             side = (trade.get("side", "BUY") or "BUY").lower()
-            current_price = to_float(self.client.get_current_price(symbol))
+
+            # Use provided exit_price if available, otherwise fetch current price
+            current_price = to_float(exit_price) if exit_price is not None else to_float(self.client.get_current_price(symbol))
 
             if entry_price <= 0 or current_price <= 0 or qty <= 0:
                 return 0.0
@@ -593,3 +602,49 @@ class TradingEngine:
         except Exception as e:
             logger.error(f"Error calculating virtual PnL for {trade.get('symbol')}: {e}")
             return 0.0
+
+    def _update_capital_json(self, account_type: str, amount: float):
+        """Update capital.json file with trade amounts"""
+        try:
+            import json
+            capital_file = "capital.json"
+
+            # Load existing capital data
+            if os.path.exists(capital_file):
+                with open(capital_file, 'r') as f:
+                    capital_data = json.load(f)
+            else:
+                # Default structure if capital.json doesn't exist
+                capital_data = {
+                    "real": {"capital": 0.0, "available": 0.0, "used": 0.0, "start_balance": 0.0, "currency": "USDT"},
+                    "virtual": {"capital": 100.0, "available": 100.0, "used": 0.0, "start_balance": 100.0, "currency": "USDT"}
+                }
+
+            # Update the appropriate account
+            if account_type in capital_data:
+                # For trades, 'amount' typically represents the value of the position being opened.
+                # We add this to 'used' and subtract from 'available'.
+                capital_data[account_type]["used"] = to_float(capital_data[account_type]["used"]) + abs(amount)
+                capital_data[account_type]["available"] = to_float(capital_data[account_type]["available"]) - abs(amount)
+                
+                # Ensure available and used don't go below zero due to floating point inaccuracies or order of operations
+                capital_data[account_type]["available"] = max(0.0, capital_data[account_type]["available"])
+                capital_data[account_type]["used"] = max(0.0, capital_data[account_type]["used"])
+
+                # Save back to file
+                with open(capital_file, 'w') as f:
+                    json.dump(capital_data, f, indent=4)
+
+                # Also update database wallet balance
+                self.db.update_wallet_balance(
+                    account_type,
+                    available=capital_data[account_type]["available"],
+                    used=capital_data[account_type]["used"],
+                    exchange=self.exchange_name
+                )
+
+                logger.info(f"Updated {account_type} capital: available={capital_data[account_type]['available']}, used={capital_data[account_type]['used']}")
+            else:
+                logger.error(f"Account type '{account_type}' not found in capital data.")
+        except Exception as e:
+            logger.error(f"Error updating capital.json: {e}")

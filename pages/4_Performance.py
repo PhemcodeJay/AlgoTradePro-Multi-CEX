@@ -9,7 +9,7 @@ from logging_config import get_trading_logger
 
 # Page configuration
 st.set_page_config(
-    page_title="Performance - AlgoTrader Pro",
+    page_title="Performance - AlgoTraderPro V2.0",
     page_icon="📊",
     layout="wide"
 )

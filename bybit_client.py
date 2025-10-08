@@ -355,9 +355,14 @@ class BybitClient:
                 cache_time, price = self._price_cache[symbol]
                 if time.time() - cache_time < 10:
                     return price
-            result = self._make_request("GET", "/v5/market/tickers", {"category": "linear", "symbol": symbol})
-            if result and "list" in result and result["list"]:
-                price = float(result["list"][0].get("lastPrice", 0))
+            # Public endpoint - no authentication required
+            url = f"{self.base_url}/v5/market/tickers"
+            params = {"category": "linear", "symbol": symbol}
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("retCode") == 0 and "result" in result and "list" in result["result"] and result["result"]["list"]:
+                price = float(result["result"]["list"][0].get("lastPrice", 0))
                 self._price_cache[symbol] = (time.time(), price)
                 return price
             return 0.0
@@ -372,15 +377,20 @@ class BybitClient:
         try:
             timeframe_map = {'1': '1', '5': '5', '15': '15', '30': '30', '60': '60', '240': '240', '1440': 'D'}
             timeframe = timeframe_map.get(interval, '60')
-            result = self._make_request("GET", "/v5/market/kline", {
+            # Public endpoint - no authentication required
+            url = f"{self.base_url}/v5/market/kline"
+            params = {
                 "category": "linear",
                 "symbol": symbol,
                 "interval": timeframe,
                 "limit": str(limit)
-            })
-            if result and "list" in result:
+            }
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            if result.get("retCode") == 0 and "result" in result and "list" in result["result"]:
                 klines = []
-                for k in result["list"]:
+                for k in result["result"]["list"]:
                     klines.append({
                         "timestamp": int(k[0]),
                         "open": float(k[1]),

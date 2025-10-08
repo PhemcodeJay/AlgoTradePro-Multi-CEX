@@ -10,7 +10,7 @@ from typing import Any
 
 # Page configuration
 st.set_page_config(
-    page_title="Trades - AlgoTrader Pro",
+    page_title="Trades - AlgoTraderPro V2.0",
     page_icon="💰",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -21,17 +21,17 @@ st.set_page_config(
 # -------------------------
 GLOBAL_CSS = """
 <style>
-/* Background and card feel */
-body { background-color: #071021; color: #e6eef8; }
+/* Background and card feel - WHITE THEME */
+body { background-color: #ffffff; color: #1a1a1a; }
 /* Streamlit main content area */
-.stApp { background-color: #071021; }
+.stApp { background-color: #ffffff; }
 /* Headings */
-h1, h2, h3, h4, h5 { color: #f3b400 !important; }
+h1, h2, h3, h4, h5 { color: #a8b7e7ff !important; }
 /* Buttons */
-.stButton>button { background-color: #f3b400; color: #071021; font-weight: 600; border-radius: 6px; }
+.stButton>button { background-color: #a8b7e7ff; color: #ffffff; font-weight: 600; border-radius: 6px; }
 .stButton>button:hover { filter: brightness(0.95); }
 /* Metric value colour (override) */
-[data-testid="metric-container"] div[role="heading"] { color: #e6eef8 !important; }
+[data-testid="metric-container"] div[role="heading"] { color: #1a1a1a !important; }
 /* Tables created via markdown (we style our own HTML) */
 </style>
 """
@@ -71,13 +71,24 @@ def pct(part: float, whole: float) -> float:
     except Exception:
         return 0.0
 
+def format_price(value: float) -> str:
+    """Formats a float value into a string with K, M, B suffixes."""
+    if abs(value) < 1000:
+        return f"${value:,.2f}"
+    elif abs(value) < 1000000:
+        return f"${value / 1000:.2f}K"
+    elif abs(value) < 1000000000:
+        return f"${value / 1000000:.2f}M"
+    else:
+        return f"${value / 1000000000:.2f}B"
+
 # -------------------------
 # Styling helpers (Binance-style: dark-ish header, yellow accents)
 # -------------------------
 BANNER_HTML = """
-<div style="background-color:#0b1220;padding:12px;border-radius:8px;margin-bottom:8px;">
-  <h2 style="color:#f3b400;margin:0 0 4px 0">💰 Trading Operations</h2>
-  <div style="color:#cbd5e1;font-size:14px">Interactive trades dashboard — virtual & real modes</div>
+<div style="background-color:#f8f9fa;padding:12px;border-radius:8px;margin-bottom:8px;border:1px solid #dee2e6;">
+  <h2 style="color:#a8b7e7ff;margin:0 0 4px 0">💰 Trading Operations</h2>
+  <div style="color:#6c757d;font-size:14px">Interactive trades dashboard — virtual & real modes</div>
 </div>
 """
 def highlight_pnl_html(val_str: str) -> str:
@@ -120,13 +131,13 @@ try:
         st.metric(f"{account_type.title()} Trades", stats.get('total_trades', 0))
 
     with col2:
-        st.metric(f"{account_type.title()} P&L", f"${safe_float(stats.get('total_pnl', 0)):.2f}")
+        st.metric(f"Total {account_type.title()} P&L", format_price(safe_float(stats.get('total_pnl', 0))))
 
     with col3:
         st.metric(f"{account_type.title()} Win Rate", f"{safe_float(stats.get('win_rate', 0)):.1f}%")
 
     with col4:
-        st.metric(f"Avg {account_type.title()} P&L", f"${safe_float(stats.get('avg_pnl', 0)):.2f}")
+        st.metric(f"Avg {account_type.title()} P&L", format_price(safe_float(stats.get('avg_pnl', 0))))
 
 except Exception as e:
     logger.error(f"Error loading trade statistics: {e}")
@@ -274,7 +285,7 @@ with tab1:
     # Interactive filters for open positions
     col_filter, col_refresh = st.columns([3, 1])
     with col_filter:
-        symbol_filter = st.selectbox("Filter symbol", options=["All"], index=0, key="open_symbol_filter")
+        # symbol_filter = st.selectbox("Filter symbol", options=["All"], index=0, key="open_symbol_filter") # old
         side_filter = st.selectbox("Side", options=["All", "BUY", "SELL", "LONG", "SHORT"], index=0, key="open_side_filter")
     with col_refresh:
         refresh_interval = st.selectbox(
@@ -293,9 +304,14 @@ with tab1:
         symbols = sorted({safe_str(t.symbol) for t in open_trades if getattr(t, "symbol", None)})
         symbol_filter_opts = ["All"] + symbols
         # replace previously selected if needed
-        if "open_symbol_filter" in st.session_state and st.session_state.open_symbol_filter not in symbol_filter_opts:
-            st.session_state.open_symbol_filter = "All"
-        symbol_filter = st.selectbox("Filter symbol", options=symbol_filter_opts, index=symbol_filter_opts.index(symbol_filter) if symbol_filter in symbol_filter_opts else 0, key="open_symbol_filter")
+        if "open_positions_symbol_filter" in st.session_state and st.session_state.open_positions_symbol_filter not in symbol_filter_opts:
+            st.session_state.open_positions_symbol_filter = "All"
+        symbol_filter = st.selectbox(
+            "Filter by Symbol",
+            ["All"] + list(set([t.symbol for t in open_trades])),
+            key='open_positions_symbol_filter'
+        )
+
 
         # Filter trades defensively
         def open_trade_matches(t):
@@ -342,7 +358,7 @@ with tab1:
                     "Quantity": f"{qty:.6f}",
                     "Entry Price": f"${entry:.6f}",
                     "Current Price": f"${current_price:.6f}",
-                    "Current P&L": f"${pnl_val:.2f}",
+                    "Current P&L": format_price(pnl_val),
                     "TP": f"${safe_float(getattr(t, 'tp', None)):.6f}" if getattr(t, 'tp', None) is not None else "N/A",
                     "SL": f"${safe_float(getattr(t, 'sl', None)):.6f}" if getattr(t, 'sl', None) is not None else "N/A",
                     "Opened": safe_dt(opened)
@@ -356,14 +372,14 @@ with tab1:
             if sort_by in df.columns:
                 # convert P&L to numeric for sorting
                 if sort_by == "Current P&L":
-                    df["_pnl_sort"] = df["Current P&L"].apply(lambda x: safe_float(str(x).replace("$", "").replace(",", ""), 0.0))
+                    df["_pnl_sort"] = df["Current P&L"].apply(lambda x: safe_float(str(x).replace("$", "").replace(",", "").replace("K", "000").replace("M", "000000").replace("B", "000000000"), 0.0))
                     df = df.sort_values(by="_pnl_sort", ascending=ascending).drop(columns=["_pnl_sort"])
                 else:
                     df = df.sort_values(by=sort_by, ascending=ascending)
 
             # display as styled HTML table with colored P&L (Binance-style colors)
             def df_to_html_table(dframe: pd.DataFrame) -> str:
-                headers = "".join([f"<th style='padding:6px 10px;background:#111827;color:#f3b400;border-bottom:1px solid #2b2f33'>{h}</th>" for h in dframe.columns])
+                headers = "".join([f"<th style='padding:6px 10px;background:#f8f9fa;color:#a8b7e7ff;border-bottom:2px solid #dee2e6'>{h}</th>" for h in dframe.columns])
                 rows_html = []
                 for _, r in dframe.iterrows():
                     cols = []
@@ -371,12 +387,12 @@ with tab1:
                         v = r[col]
                         if col in ["Current P&L", "P&L"]:
                             v_html = highlight_pnl_html(str(v))
-                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #2b2f33'>{v_html}</td>")
+                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #dee2e6'>{v_html}</td>")
                         else:
-                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #2b2f33;color:#e6eef8'>{v}</td>")
+                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #dee2e6;color:#1a1a1a'>{v}</td>")
                     rows_html.append("<tr>" + "".join(cols) + "</tr>")
                 table = f"""
-                <table style='width:100%;border-collapse:collapse;margin-top:8px'>
+                <table style='width:100%;border-collapse:collapse;margin-top:8px;background:#ffffff'>
                   <thead><tr>{headers}</tr></thead>
                   <tbody>{''.join(rows_html)}</tbody>
                 </table>
@@ -482,7 +498,7 @@ with tab2:
                         duration_delta = closed_ref - created
                         duration = str(duration_delta).split('.')[0]  # Remove microseconds
                     else:
-                        duration = "0:00:00"  
+                        duration = "0:00:00"
 
 
                 rows.append({
@@ -493,7 +509,7 @@ with tab2:
                     "Quantity": f"{safe_float(getattr(t, 'qty', 0.0)):.6f}",
                     "Entry": f"${safe_float(getattr(t, 'entry_price', 0.0)):.6f}",
                     "Exit": f"${safe_float(getattr(t, 'exit_price', 0.0)):.6f}" if getattr(t, "exit_price", None) is not None else "N/A",
-                    "P&L": f"${safe_float(getattr(t, 'pnl', 0.0)):.2f}",
+                    "P&L": format_price(safe_float(getattr(t, 'pnl', 0.0))),
                     "Duration": duration,
                     "Closed": closed_str
                 })
@@ -501,7 +517,7 @@ with tab2:
             df_closed = pd.DataFrame(rows)
             # show styled HTML (colored P&L)
             def html_for_closed(dfc: pd.DataFrame) -> str:
-                headers = "".join([f"<th style='padding:6px 10px;background:#111827;color:#f3b400;border-bottom:1px solid #2b2f33'>{h}</th>" for h in dfc.columns])
+                headers = "".join([f"<th style='padding:6px 10px;background:#f8f9fa;color:#a8b7e7ff;border-bottom:2px solid #dee2e6'>{h}</th>" for h in dfc.columns])
                 rows_html = []
                 for _, r in dfc.iterrows():
                     cols = []
@@ -509,11 +525,11 @@ with tab2:
                         v = r[col]
                         if col == "P&L":
                             v_html = highlight_pnl_html(str(v))
-                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #2b2f33'>{v_html}</td>")
+                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #dee2e6'>{v_html}</td>")
                         else:
-                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #2b2f33;color:#e6eef8'>{v}</td>")
+                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #dee2e6;color:#1a1a1a'>{v}</td>")
                     rows_html.append("<tr>" + "".join(cols) + "</tr>")
-                table = f"<table style='width:100%;border-collapse:collapse;margin-top:8px'><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
+                table = f"<table style='width:100%;border-collapse:collapse;margin-top:8px;background:#ffffff'><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
                 return table
 
             st.markdown(html_for_closed(df_closed), unsafe_allow_html=True)
@@ -609,7 +625,7 @@ with tab3:
         try:
             wallet = db_manager.get_wallet_balance(account_type)
             balance = safe_float(getattr(wallet, "available", None), default=100.0) if wallet else 100.0
-            st.metric("Available Balance", f"${balance:.2f}")
+            st.metric("Available Balance", format_price(balance))
 
             risk_percent = st.slider("Risk %", 0.1, 10.0, 1.0, 0.1)
             leverage = st.slider("Leverage", 1, 20, 10)
@@ -619,8 +635,8 @@ with tab3:
 
             if entry_price > 0:
                 position_size = position_value / entry_price
-                st.write(f"**Risk Amount:** ${risk_amount:.2f}")
-                st.write(f"**Position Value:** ${position_value:.2f}")
+                st.write(f"**Risk Amount:** {format_price(risk_amount)}")
+                st.write(f"**Position Value:** {format_price(position_value)}")
                 st.write(f"**Position Size:** {position_size:.6f}")
 
                 if tp_price > 0 and sl_price > 0:
@@ -631,8 +647,8 @@ with tab3:
                         potential_profit = (entry_price - tp_price) * position_size
                         potential_loss = (sl_price - entry_price) * position_size
 
-                    st.write(f"**Potential Profit:** ${potential_profit:.2f}")
-                    st.write(f"**Potential Loss:** ${potential_loss:.2f}")
+                    st.write(f"**Potential Profit:** {format_price(potential_profit)}")
+                    st.write(f"**Potential Loss:** {format_price(potential_loss)}")
                     if potential_loss != 0:
                         st.write(f"**R:R Ratio:** 1:{abs(potential_profit/potential_loss):.2f}")
 
@@ -731,8 +747,8 @@ except Exception:
 
 st.markdown(f"""
 ---
-**Status:** Exchange: {safe_str(current_exchange).title()} | 
-Mode: {safe_str(account_type).title()} | 
-Open Positions: {open_count} | 
+**Status:** Exchange: {safe_str(current_exchange).title()} |
+Mode: {safe_str(account_type).title()} |
+Open Positions: {open_count} |
 Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
 """, unsafe_allow_html=True)

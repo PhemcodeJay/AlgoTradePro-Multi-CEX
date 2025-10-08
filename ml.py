@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -12,9 +12,9 @@ import sys
 import argparse
 from db import DatabaseManager, FeedbackModel
 from numpy.typing import NDArray
-from logging_config import get_logger
+from logging_config import get_trading_logger
 
-logger = get_logger(__name__)
+logger = get_trading_logger(__name__)
 
 # Load exchange and mode
 EXCHANGE = os.getenv("EXCHANGE", "binance").lower()
@@ -25,55 +25,35 @@ class MLFilter:
         self.model = None
         self.scaler = StandardScaler()
         self.feature_columns = [
-            'rsi', 'macd', 'macd_signal', 'macd_histogram',
-            'bb_position', 'volume_ratio', 'trend_score', 'volatility',
-            'price_change_1h', 'price_change_4h', 'price_change_24h'
+            'rsi', 'stoch_rsi_k', 'stoch_rsi_d', 'macd', 'macd_signal',
+            'macd_histogram', 'bb_upper', 'bb_middle', 'bb_lower',
+            'sma_200', 'ema_9', 'volume_ratio', 'price_change_1h',
+            'price_change_4h', 'price_change_24h'
         ]
-        self.model_path = f"ml_model_{EXCHANGE}.joblib"
-        self.scaler_path = f"ml_scaler_{EXCHANGE}.joblib"
+        self.model_path = f"models/ml_model_{EXCHANGE}.joblib"
+        self.scaler_path = f"models/ml_scaler_{EXCHANGE}.joblib"
         
         # Load existing model if available
         self.load_model()
 
-    def prepare_features(self, indicators: Dict[str, Any]) -> NDArray[np.float64]:
+    def prepare_features(self, indicators: Dict[str, Any]) -> Optional[NDArray[np.float64]]:
         """Prepare features from indicators for ML prediction"""
         try:
-            # Extract basic indicators
-            rsi = indicators.get('rsi', 50)
-            macd = indicators.get('macd', 0)
-            macd_signal = indicators.get('macd_signal', 0)
-            macd_histogram = indicators.get('macd_histogram', 0)
-            volume_ratio = indicators.get('volume_ratio', 1)
-            trend_score = indicators.get('trend_score', 0)
-            volatility = indicators.get('volatility', 0)
+            # Extract indicators matching those from indicators.py
+            features = []
+            for key in self.feature_columns:
+                value = indicators.get(key, 0.0)
+                if value is None:
+                    logger.warning(f"Missing or None value for {key} in indicators")
+                    value = 0.0
+                features.append(float(value))
             
-            # Calculate Bollinger Band position
-            price = indicators.get('price', 0)
-            bb_upper = indicators.get('bb_upper', 0)
-            bb_lower = indicators.get('bb_lower', 0)
-            bb_middle = indicators.get('bb_middle', 0)
-            
-            if bb_upper > bb_lower:
-                bb_position = (price - bb_lower) / (bb_upper - bb_lower)
-            else:
-                bb_position = 0.5
-            
-            # Price change features
-            price_change_1h = indicators.get('price_change_1h', 0)
-            price_change_4h = indicators.get('price_change_4h', 0)
-            price_change_24h = indicators.get('price_change_24h', 0)
-            
-            features = np.array([
-                rsi, macd, macd_signal, macd_histogram,
-                bb_position, volume_ratio, trend_score, volatility,
-                price_change_1h, price_change_4h, price_change_24h
-            ]).reshape(1, -1)
-            
-            return features
+            features_array = np.array(features).reshape(1, -1)
+            return features_array
             
         except Exception as e:
             logger.error(f"Error preparing features for {EXCHANGE}: {e}")
-            return np.array([]).reshape(1, -1)
+            return None
 
     def train_model(self, training_data: List[Dict]) -> bool:
         """Train the ML model with historical trade data"""
@@ -87,7 +67,7 @@ class MLFilter:
             
             for data in training_data:
                 features = self.prepare_features(data['indicators'])
-                if features.shape[1] > 0:
+                if features is not None and features.shape[1] == len(self.feature_columns):
                     X.append(features.flatten())
                     y.append(1 if data.get('pnl', 0) > 0 else 0)
             
@@ -118,6 +98,7 @@ class MLFilter:
             y_pred = self.model.predict(X_test_scaled)
             accuracy = accuracy_score(y_test, y_pred)
             logger.info(f"Model accuracy for {EXCHANGE}: {accuracy:.2f}")
+            logger.debug(f"Classification report:\n{classification_report(y_test, y_pred)}")
             
             # Save model
             self.save_model()
@@ -138,7 +119,8 @@ class MLFilter:
             filtered = []
             for signal in signals:
                 features = self.prepare_features(signal.get('indicators', {}))
-                if features.shape[1] == 0:
+                if features is None or features.shape[1] != len(self.feature_columns):
+                    logger.warning(f"Invalid features for signal {signal.get('symbol', 'UNKNOWN')}")
                     continue
                 
                 features_scaled = self.scaler.transform(features)
@@ -158,9 +140,10 @@ class MLFilter:
     def save_model(self) -> bool:
         """Save trained model and scaler"""
         try:
+            os.makedirs('models', exist_ok=True)
             joblib.dump(self.model, self.model_path)
             joblib.dump(self.scaler, self.scaler_path)
-            logger.info(f"Model saved for {EXCHANGE}")
+            logger.info(f"Model and scaler saved for {EXCHANGE} at {self.model_path}")
             return True
         except Exception as e:
             logger.error(f"Error saving model for {EXCHANGE}: {e}")
@@ -172,8 +155,9 @@ class MLFilter:
             if os.path.exists(self.model_path) and os.path.exists(self.scaler_path):
                 self.model = joblib.load(self.model_path)
                 self.scaler = joblib.load(self.scaler_path)
-                logger.info(f"ML model loaded for {EXCHANGE}")
+                logger.info(f"ML model and scaler loaded for {EXCHANGE} from {self.model_path}")
                 return True
+            logger.warning(f"No model or scaler found at {self.model_path} or {self.scaler_path}")
             return False
         except Exception as e:
             logger.error(f"Error loading model for {EXCHANGE}: {e}")
@@ -185,28 +169,27 @@ class MLFilter:
             logger.info(f"Feedback received for {signal.get('symbol')} on {EXCHANGE}: {outcome}")
             
             db_manager = DatabaseManager()
-            feedback_model = FeedbackModel(
-                symbol=signal.get('symbol', 'UNKNOWN'),
-                exchange=EXCHANGE,
-                outcome=outcome,
-                pnl=signal.get('pnl', 0),
-                indicators=signal.get('indicators', {})
-            )
-            db_manager.add_feedback(feedback_model)
-            
-            # Retrain if enough new feedback
-            feedback = db_manager.get_feedback(limit=100, exchange=EXCHANGE)
-            if len(feedback) >= 50:
-                training_data = [
-                    {'indicators': f.indicators, 'pnl': f.pnl}
-                    for f in feedback if f.indicators is not None and f.pnl is not None
-                ]
-                self.train_model(training_data)
+            with db_manager.get_session() as session:
+                feedback_model = FeedbackModel(
+                    symbol=signal.get('symbol', 'UNKNOWN'),
+                    exchange=EXCHANGE,
+                    outcome=outcome,
+                    pnl=signal.get('pnl', 0),
+                    indicators=signal.get('indicators', {})
+                )
+                db_manager.add_feedback(feedback_model)
+                
+                # Retrain if enough new feedback
+                feedback = db_manager.get_feedback(limit=100, exchange=EXCHANGE)
+                if len(feedback) >= 50:
+                    training_data = [
+                        {'indicators': f.indicators, 'pnl': f.pnl}
+                        for f in feedback if f.indicators is not None and f.pnl is not None
+                    ]
+                    self.train_model(training_data)
             
         except Exception as e:
             logger.error(f"Error updating model with feedback for {EXCHANGE}: {e}")
-        finally:
-            db_manager.session.close()
 
     def get_feature_importance(self) -> Dict[str, float]:
         """Get feature importance from trained model"""
@@ -236,39 +219,38 @@ if __name__ == '__main__':
     try:
         if args.train:
             # Fetch trades from database for training, filter by exchange and include both modes
-            trades = db_manager.get_trades(limit=1000, exchange=EXCHANGE)
-            if not trades:
-                logger.error(f"No trades found in database for training on {EXCHANGE}")
-                print(json.dumps({'success': False, 'error': 'No trades found'}))
-                sys.exit(1)
-            
-            training_data = [
-                {
-                    'indicators': trade.indicators,
-                    'pnl': trade.pnl
-                }
-                for trade in trades
-                if trade.indicators is not None and trade.pnl is not None
-            ]
-            
-            success = ml_filter.train_model(training_data)
-            print(json.dumps({'success': success}))
+            with db_manager.get_session() as session:
+                trades = db_manager.get_trades(limit=1000, exchange=EXCHANGE)
+                if not trades:
+                    logger.error(f"No trades found in database for training on {EXCHANGE}")
+                    print(json.dumps({'success': False, 'error': 'No trades found'}))
+                    sys.exit(1)
+                
+                training_data = [
+                    {
+                        'indicators': trade.indicators,
+                        'pnl': trade.pnl
+                    }
+                    for trade in trades
+                    if trade.indicators is not None and trade.pnl is not None
+                ]
+                
+                success = ml_filter.train_model(training_data)
+                print(json.dumps({'success': success}))
         else:
             # Fetch signals from database
-            signals = [signal.to_dict() for signal in db_manager.get_signals(limit=100, exchange=EXCHANGE)]
-            if not signals:
-                logger.error(f"No signals found in database for {EXCHANGE}")
-                print(json.dumps([]))
-                sys.exit(0)
-            
-            # Filter signals
-            filtered_signals = ml_filter.filter_signals(signals, threshold=args.threshold)
-            print(json.dumps(filtered_signals, indent=2))
+            with db_manager.get_session() as session:
+                signals = [signal.to_dict() for signal in db_manager.get_signals(limit=100, exchange=EXCHANGE)]
+                if not signals:
+                    logger.error(f"No signals found in database for {EXCHANGE}")
+                    print(json.dumps([]))
+                    sys.exit(0)
+                
+                # Filter signals
+                filtered_signals = ml_filter.filter_signals(signals, threshold=args.threshold)
+                print(json.dumps(filtered_signals, indent=2))
             
     except Exception as e:
         logger.error(f"Error in main execution for {EXCHANGE}: {e}")
         print(json.dumps({'error': str(e)}))
         sys.exit(1)
-    
-    finally:
-        db_manager.session.close()

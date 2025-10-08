@@ -7,6 +7,7 @@ from notifications import send_all_notifications
 from db import Signal, db_manager
 from logging_config import get_logger
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = get_logger(__name__)
 
@@ -94,38 +95,72 @@ def enhance_signal(analysis: Dict[str, Any]) -> Dict[str, Any]:
     })
     return enhanced
 
-def generate_signals(exchange: str, symbols: List[str], interval: str = "60", top_n: int = 5, threshold: float = 0.6) -> List[Dict[str, Any]]:
-    raw_analyses = scan_multiple_symbols(exchange, symbols, interval)
-    scored = []
-    for analysis in raw_analyses:
-        analysis['score'] = calculate_signal_score(analysis)
-        scored.append(analysis)
-    scored.sort(key=lambda x: x['score'], reverse=True)
-    top = scored[:top_n]
-    enhanced = [enhance_signal(a) for a in top]
-    ml_filter = MLFilter()
-    filtered = ml_filter.filter_signals(enhanced, threshold=threshold)
-    for f in filtered:
-        signal_obj = Signal(
-            symbol=str(f.get("symbol") or "UNKNOWN"),
-            interval=interval,
-            signal_type=str(f.get("signal_type", "BUY")),
-            side=str(f.get("side", "BUY")),
-            score=float(f.get("score", 0)),
-            entry=float(f.get("entry") or 0),
-            sl=float(f.get("sl") or 0),
-            tp=float(f.get("tp") or 0),
-            trail=float(f.get("trail") or 0),
-            liquidation=float(f.get("liquidation") or 0),
-            leverage=int(f.get("leverage", 10)),
-            margin_usdt=float(f.get("margin_usdt") or 0),
-            market=str(f.get("market", "Unknown")),
-            indicators=f.get("indicators", {}),
-            exchange=exchange,
-            created_at=f.get("created_at") or datetime.now(timezone.utc)
-        )
-        db_manager.add_signal(signal_obj)
-    return filtered
+def generate_signals(exchange: str = "binance", timeframe: str = "1h", max_symbols: int = 50, top_n: int = 20) -> List[Dict[str, Any]]:
+    """Generate and store trading signals for multiple symbols"""
+    try:
+        # Step 1: Get top symbols
+        symbols = get_top_symbols(exchange, max_symbols)
+        logger.info(f"Generating signals for {len(symbols)} symbols on {exchange} ({timeframe})")
+
+        signals = []
+        # Step 2: Analyze each symbol concurrently
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(analyze_single_symbol, exchange, symbol, timeframe): symbol
+                for symbol in symbols
+            }
+
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    result = future.result()
+                    if result and result.get('symbol'):
+                        signals.append(result)
+                        logger.debug(f"Signal generated for {symbol}")
+                except Exception as e:
+                    logger.error(f"Error analyzing {symbol}: {e}")
+
+        # Step 3: Score and rank signals
+        for sig in signals:
+            sig['score'] = calculate_signal_score(sig)
+        scored = sorted(signals, key=lambda x: x['score'], reverse=True)
+
+        # Step 4: Select top signals and enhance them
+        top_signals = scored[:top_n]
+        enhanced_signals = [enhance_signal(s) for s in top_signals]
+
+        # Step 5: Filter using ML model
+        ml_filter = MLFilter()
+        filtered_signals = ml_filter.filter_signals(enhanced_signals, threshold=0.6)
+
+        # Step 6: Save to DB
+        for f in filtered_signals:
+            signal_obj = Signal(
+                symbol=str(f.get("symbol", "UNKNOWN")),
+                interval=timeframe,
+                signal_type=str(f.get("signal_type", "BUY")),
+                side=str(f.get("side", "BUY")),
+                score=float(f.get("score", 0)),
+                entry=float(f.get("entry", 0)),
+                sl=float(f.get("sl", 0)),
+                tp=float(f.get("tp", 0)),
+                trail=float(f.get("trail", 0)),
+                liquidation=float(f.get("liquidation", 0)),
+                leverage=int(f.get("leverage", 10)),
+                margin_usdt=float(f.get("margin_usdt", 0)),
+                market=str(f.get("market", "Unknown")),
+                indicators=f.get("indicators", {}),
+                exchange=exchange,
+                created_at=f.get("created_at") or datetime.now(timezone.utc)
+            )
+            db_manager.add_signal(signal_obj)
+
+        logger.info(f"✅ Generated {len(filtered_signals)} filtered signals out of {len(signals)} analyzed.")
+        return filtered_signals
+
+    except Exception as e:
+        logger.error(f"An error occurred during signal generation: {e}")
+        return []
 
 def get_signal_summary(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not signals:

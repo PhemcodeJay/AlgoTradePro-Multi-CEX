@@ -108,7 +108,7 @@ class AutomatedTrader:
                 time.sleep(60)  # Prevent tight loop on error
     
     async def _execute_trading_cycle(self):
-        """Execute one cycle of trading operations"""
+        """Execute one cycle of trading operations using real market data"""
         try:
             self.scan_count += 1
             self.last_scan_time = datetime.now(timezone.utc)
@@ -119,13 +119,13 @@ class AutomatedTrader:
                 logger.warning("No symbols retrieved for trading")
                 return
             
-            # Generate signals
+            # Generate signals using real market data (regardless of trading mode)
             signals = generate_signals(self.trading_engine.exchange_name, symbols, interval="60", top_n=self.top_n_signals)
             self.total_signals_generated += len(signals)
             
             # Log signal summary
             summary = get_signal_summary(signals)
-            logger.info(f"Trading cycle completed: {summary}")
+            logger.info(f"Trading cycle completed with real data: {summary}")
             
             if not signals:
                 logger.info("No signals generated in this cycle")

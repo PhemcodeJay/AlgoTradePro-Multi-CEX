@@ -20,7 +20,6 @@ from exceptions import (
     APIErrorRecoveryStrategy, create_error_context
 )
 
-# Import types for static analysis only
 if TYPE_CHECKING:
     from db import DatabaseManager, Trade, WalletBalance
 else:
@@ -40,10 +39,21 @@ class RateLimitInfo:
 
 class BinanceClient:
     def __init__(self):
-        self.api_key: str = os.getenv("BINANCE_API_KEY", "")
-        self.api_secret: str = os.getenv("BINANCE_API_SECRET", "")
-        self.account_type: str = os.getenv("BINANCE_ACCOUNT_TYPE", "SPOT").upper()
+        """Initialize Binance client"""
+        try:
+            self.api_key = os.getenv("BINANCE_API_KEY")
+            self.api_secret = os.getenv("BINANCE_API_SECRET")
+            self._request_count = 0
+            self._last_reset = datetime.now(timezone.utc)
+        except Exception as e:
+            raise APIConnectionException(
+                f"Failed to initialize API credentials: {str(e)}",
+                endpoint='api_init',
+                context=create_error_context(module=__name__, function='__init__'),
+                original_exception=e
+            )
 
+        self.account_type: str = os.getenv("BINANCE_ACCOUNT_TYPE", "FUTURES").upper()
         self.base_url: str = "https://api.binance.com"
         self.ws_url: str = "wss://stream.binance.com:9443"
         self.session = None
@@ -53,20 +63,18 @@ class BinanceClient:
         self._connected = False
         self._connection_lock = threading.Lock()
 
-        # Rate limiting
         self.rate_limit = RateLimitInfo()
         self.rate_limit_lock = threading.Lock()
+        self.production_rate_limit_interval = 1
+        self.production_rate_limit_count = 10
 
-        # Error handling
         self.recovery_strategy = APIErrorRecoveryStrategy(max_retries=3, delay=1.0)
         self.last_error_time = None
         self.consecutive_errors = 0
 
-        # Timeout configuration
         self.request_timeout = 30
         self.connect_timeout = 10
 
-        # Health monitoring
         self.last_successful_request = None
         self.total_requests = 0
         self.successful_requests = 0
@@ -77,7 +85,7 @@ class BinanceClient:
             'secret': self.api_secret,
             'enableRateLimit': True,
             'timeout': 30000,
-        })  # type: ignore
+        })
         self.exchange.set_sandbox_mode(False)
 
         self._initialize_session()
@@ -154,6 +162,18 @@ class BinanceClient:
             self.rate_limit.minute_count += 1
             return True
 
+    def _check_production_rate_limit(self) -> None:
+        now = datetime.now(timezone.utc)
+        if (now - self._last_reset).total_seconds() >= self.production_rate_limit_interval:
+            self._request_count = 0
+            self._last_reset = now
+        if self._request_count >= self.production_rate_limit_count:
+            sleep_time = self.production_rate_limit_interval - (now - self._last_reset).total_seconds()
+            if sleep_time > 0:
+                logger.warning(f"Production rate limit hit, sleeping for {sleep_time:.2f} seconds")
+                time.sleep(sleep_time)
+        self._request_count += 1
+
     def _validate_api_credentials(self) -> bool:
         if not self.api_key or not self.api_secret:
             raise APIAuthenticationException(
@@ -174,7 +194,11 @@ class BinanceClient:
 
     def _make_request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
         self._validate_api_credentials()
-        self._check_rate_limit()
+        if TRADING_MODE != "virtual":
+            self._check_production_rate_limit()
+        else:
+            self._check_rate_limit()
+
         url = f"{self.base_url}{endpoint}"
         params = params or {}
         start_time = time.time()
@@ -236,6 +260,21 @@ class BinanceClient:
     async def _make_request_async(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
         return await asyncio.to_thread(self._make_request, method, endpoint, params)
 
+    def _test_connection(self) -> bool:
+        try:
+            url = f"{self.base_url}/api/v3/ping"
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            if response.json() == {}:
+                self._connected = True
+                logger.info("API connection test successful")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Connection test failed: {e}")
+            self._connected = False
+            return False
+
     def is_connected(self) -> bool:
         if not self._connected:
             try:
@@ -245,144 +284,60 @@ class BinanceClient:
                 self._connected = False
         return self._connected and bool(self.api_key and self.api_secret)
 
-    def _test_connection(self) -> bool:
-        try:
-            if not self.api_key or not self.api_secret:
-                logger.error("API credentials missing in .env")
-                self._connected = False
-                return False
-            result = self._make_request("GET", "/api/v3/ping", {})
-            self._connected = True
-            logger.info(f"API connection test successful", extra={'endpoint': '/api/v3/ping', 'environment': 'mainnet', 'account_type': self.account_type})
-            return True
-        except APIAuthenticationException as e:
-            self._connected = False
-            logger.error(f"API authentication failed during connection test: {str(e)}", extra={'error_type': 'authentication', 'environment': 'mainnet', 'account_type': self.account_type})
-            return False
-        except APIRateLimitException as e:
-            self._connected = False
-            logger.warning(f"Rate limit hit during connection test: {str(e)}", extra={'error_type': 'rate_limit', 'retry_after': e.retry_after})
-            return False
-        except APIException as e:
-            self._connected = False
-            logger.error(f"API error during connection test: {str(e)}", extra={'error_type': 'api_error', 'error_code': e.error_code})
-            return False
-        except Exception as e:
-            self._connected = False
-            logger.error(f"Unexpected error during connection test: {str(e)}", extra={'error_type': 'unexpected'})
-            return False
-
-    def get_connection_health(self) -> Dict[str, Any]:
-        try:
-            server_time = self._make_request("GET", "/api/v3/time", {}).get("serverTime", 0)
-            current_time = int(time.time() * 1000)
-            time_diff = abs(current_time - int(server_time)) if server_time else float('inf')
-            status = 'healthy' if time_diff < 5000 else 'degraded'
-            self.last_successful_request = datetime.now()
-        except Exception as e:
-            logger.error(f"Binance health check failed: {e}")
-            status = 'unhealthy'
-            time_diff = float('inf')
-            server_time = 0
-        health_info = {
-            'connected': self._connected,
-            'environment': 'mainnet',
-            'account_type': self.account_type,
-            'api_configured': bool(self.api_key and self.api_secret),
-            'last_successful_request': self.last_successful_request.isoformat() if self.last_successful_request else None,
-            'consecutive_errors': self.consecutive_errors,
-            'status': status,
-            'server_time': server_time,
-            'local_time': current_time,
-            'time_diff': time_diff,
-            'statistics': {
-                'total_requests': self.total_requests,
-                'successful_requests': self.successful_requests,
-                'failed_requests': self.failed_requests,
-                'success_rate': round((self.successful_requests / max(self.total_requests, 1)) * 100, 2)
-            },
-            'rate_limiting': {
-                'requests_per_second': self.rate_limit.requests_per_second,
-                'requests_per_minute': self.rate_limit.requests_per_minute,
-                'current_minute_count': self.rate_limit.minute_count
-            }
-        }
-        return health_info
-
-    def get_account_balance(self) -> Dict[str, 'WalletBalance']:
-        db_manager = DatabaseManager()
-        try:
-            if not self.api_key or not self.api_secret:
-                logger.warning("API credentials required for balance check")
-                return {}
-            result = self._make_request("GET", "/api/v3/account", {})
-            balances: Dict[str, WalletBalance] = {}
-            if result and "balances" in result:
-                for asset in result["balances"]:
-                    symbol = asset.get("asset", "")
-                    if not symbol:
-                        continue
-                    free = float(asset.get("free", 0) or 0.0)
-                    locked = float(asset.get("locked", 0) or 0.0)
-                    total = free + locked
-                    balances[symbol] = WalletBalance(
-                        trading_mode=TRADING_MODE,
-                        capital=total,
-                        available=free,
-                        used=locked,
-                        start_balance=total,
-                        currency=symbol,
-                        updated_at=datetime.utcnow(),
-                    )
-            return balances
-        except Exception as e:
-            logger.error(f"Error getting account balance from Binance: {e}")
-            return {}
-        finally:
-            db_manager.session.close()
-
     def get_current_price(self, symbol: str) -> float:
         try:
             if not '/' in symbol and symbol.endswith('USDT'):
                 symbol = symbol.replace('USDT', '/USDT')
-            if symbol in self._price_cache:
-                cache_time, price = self._price_cache[symbol]
-                if time.time() - cache_time < 10:
-                    return price
-            result = self._make_request("GET", "/api/v3/ticker/price", {"symbol": symbol.replace('/', '')})
-            if result and "price" in result:
-                price = float(result["price"])
-                self._price_cache[symbol] = (time.time(), price)
-                return price
-            return 0.0
-        except Exception as e:
-            error_str = str(e)
-            if "451" in error_str or "restricted location" in error_str:
+            if TRADING_MODE == "virtual":
                 base_prices = {
                     'BTC/USDT': 65000, 'ETH/USDT': 3200, 'DOGE/USDT': 0.15,
-                    'SOL/USDT': 150, 'XRP/USDT': 0.55, 'BNB/USDT': 600, 'AVAX/USDT': 35
+                    'SOL/USDT': 150, 'XRP/USDT': 0.55, 'BNB/USDT': 600, 'AVAX/USDT': 35,
+                    'LTC/USDT': 70, 'MATIC/USDT': 0.8, 'SHIB/USDT': 0.00002,
+                    'TRX/USDT': 0.15, 'VET/USDT': 0.03, 'XLM/USDT': 0.1
                 }
-                base = base_prices.get(symbol, 100)
-                price = round(base * (1 + random.uniform(-0.01, 0.01)), 6)
+                price = base_prices.get(symbol, 100) * random.uniform(0.98, 1.02)
+                return round(price, 6)
+            cached = self._price_cache.get(symbol)
+            if cached and (time.time() - cached[0]) < 60:
+                return cached[1]
+            ticker = self._make_request("GET", "/api/v3/ticker/price", {"symbol": symbol.replace('/', '')})
+            price = float(ticker.get("price", 0))
+            if price > 0:
                 self._price_cache[symbol] = (time.time(), price)
-                return price
+            return price
+        except Exception as e:
             logger.error(f"Error getting price for {symbol}: {e}")
             return 0.0
 
     def get_current_over_price(self, symbol: str) -> float:
         return self.get_current_price(symbol)
 
-    def get_klines(self, symbol: str, interval: str, limit: int = 500) -> List[Dict]:
+    def get_klines(self, symbol: str, interval: str, limit: int = 100) -> List[Dict]:
         try:
+            if TRADING_MODE == "virtual":
+                logger.info(f"Virtual mode: Generating simulated klines for {symbol}")
+                return self._generate_simulated_klines(symbol, limit)
+            
             timeframe_map = {'1': '1m', '5': '5m', '15': '15m', '30': '30m', '60': '1h', '240': '4h', '1440': '1d'}
             timeframe = timeframe_map.get(interval, '1h')
-            if not '/' in symbol and symbol.endswith('USDT'):
-                symbol = symbol.replace('USDT', '/USDT')
-            result = self._make_request("GET", "/api/v3/klines", {
+            url = f"{self.base_url}/api/v3/klines"
+            params = {
                 "symbol": symbol.replace('/', ''),
                 "interval": timeframe,
                 "limit": str(limit)
-            })
+            }
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            result = response.json()
+            
+            if isinstance(result, dict):
+                code = result.get('code', None)
+                msg = result.get('msg', '')
+                if code == 0 and 'restricted location' in msg.lower():
+                    raise APIException(f"Binance API restricted for {symbol}: {msg}. Cannot fetch real data in real mode.")
+                else:
+                    raise APIDataException(f"Unexpected API response for {symbol}: {result}")
+            
             klines = []
             for k in result:
                 klines.append({
@@ -393,30 +348,33 @@ class BinanceClient:
                     "close": float(k[4]),
                     "volume": float(k[5])
                 })
+            logger.info(f"Successfully fetched {len(klines)} real klines for {symbol}")
             return sorted(klines, key=lambda x: x["timestamp"])
+        except APIException as e:
+            logger.error(f"API restriction error for {symbol}: {e}")
+            raise
         except Exception as e:
-            error_str = str(e)
-            if "451" in error_str or "restricted location" in error_str:
-                logger.warning(f"Binance API restricted for {symbol}, generating simulated data for virtual trading")
-                return self._generate_simulated_klines(symbol, limit)
-            logger.error(f"Error getting klines for {symbol}: {e}")
-            return []
+            logger.error(f"Error getting real klines for {symbol}: {e}")
+            raise APIConnectionException(f"Failed to fetch klines for {symbol}: {str(e)}")
 
     def _generate_simulated_klines(self, symbol: str, limit: int) -> List[Dict]:
         base_prices = {
-            'BTC/USDT': 65000, 'ETH/USDT': 3200, 'DOGE/USDT': 0.15,
-            'SOL/USDT': 150, 'XRP/USDT': 0.55, 'BNB/USDT': 600, 'AVAX/USDT': 35
+            'BTCUSDT': 65000, 'ETHUSDT': 3200, 'DOGEUSDT': 0.15,
+            'SOLUSDT': 150, 'XRPUSDT': 0.55, 'BNBUSDT': 600, 'AVAXUSDT': 35,
+            'LTCUSDT': 70, 'MATICUSDT': 0.8, 'SHIBUSDT': 0.00002,
+            'TRXUSDT': 0.15, 'VETUSDT': 0.03, 'XLMUSDT': 0.1
         }
         base_price = base_prices.get(symbol, 100)
         klines = []
         current_time = int(time.time() * 1000)
-        interval_ms = 3600000
+        interval_ms = 3600000  # 1 hour
+        limit = max(limit, 200)  # Ensure enough data for SMA_200
         for i in range(limit):
             timestamp = current_time - (limit - i) * interval_ms
-            open_price = base_price * (1 + random.uniform(-0.02, 0.02))
-            close_price = open_price * (1 + random.uniform(-0.03, 0.03))
-            high_price = max(open_price, close_price) * (1 + random.uniform(0, 0.02))
-            low_price = min(open_price, close_price) * (1 - random.uniform(0, 0.02))
+            open_price = base_price * (1 + random.uniform(-0.05, 0.05))  # Increased volatility
+            close_price = open_price * (1 + random.uniform(-0.07, 0.07))
+            high_price = max(open_price, close_price) * (1 + random.uniform(0, 0.03))
+            low_price = min(open_price, close_price) * (1 - random.uniform(0, 0.03))
             volume = random.uniform(1000000, 5000000)
             klines.append({
                 'timestamp': timestamp,
@@ -427,6 +385,7 @@ class BinanceClient:
                 'volume': round(volume, 2)
             })
             base_price = close_price
+        logger.debug(f"Generated {len(klines)} simulated klines for {symbol}")
         return klines
 
     async def place_order(
@@ -670,7 +629,8 @@ class BinanceClient:
                 logger.error("Event loop not available")
                 return
             async def websocket_handler():
-                uri = f"{self.ws_url}/ws/{'@'.join([f'{s.lower().replace('/', '')}@ticker' for s in symbols])}"
+                stream_names = '@'.join([f'{s.lower().replace("/", "")}@ticker' for s in symbols])
+                uri = f"{self.ws_url}/ws/{stream_names}"
                 try:
                     async with websockets.connect(uri) as websocket:
                         self.ws_connection = websocket

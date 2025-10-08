@@ -110,16 +110,21 @@ def initialize_app():
 
 def main():
     """Main application entry point"""
+    
+    try:
+        # Application header
+        st.title("🚀 AlgoTraderPro V2.0")
+        st.markdown("*Advanced Multi-Exchange Cryptocurrency Trading Platform*")
 
-    # Application header
-    st.title("🚀 AlgoTrader Pro")
-    st.markdown("*Advanced Multi-Exchange Cryptocurrency Trading Platform*")
-
-    # Initialize app if not done
-    if not bool(st.session_state.initialized):
-        with st.spinner("Initializing AlgoTrader Pro..."):
-            if not initialize_app():
-                st.stop()
+        # Initialize app if not done
+        if not bool(st.session_state.initialized):
+            with st.spinner("Initializing AlgoTrader Pro..."):
+                if not initialize_app():
+                    st.stop()
+    except Exception as e:
+        logger.error(f"Critical error in main: {e}")
+        st.error("⚠️ Application Error - Please refresh the page")
+        st.stop()
 
     # Load settings for current exchange and mode
     settings = load_settings()
@@ -300,10 +305,11 @@ def main():
     st.markdown("### 📊 Key Metrics")
     col1, col2, col3, col4 = st.columns(4)
 
+    is_virtual = account_type == 'virtual'
+    
     try:
         recent_signals = db_manager.get_signals(limit=10, exchange=current_exchange) or []
         wallet = db_manager.get_wallet_balance(account_type, exchange=current_exchange)
-        is_virtual = account_type == 'virtual'
         open_trades = db_manager.get_trades(status='open', virtual=is_virtual, exchange=current_exchange) or []
         closed_trades = db_manager.get_trades(status='closed', virtual=is_virtual, exchange=current_exchange) or []
         # Make sure created_at exists and is timezone-aware; wrap defensively

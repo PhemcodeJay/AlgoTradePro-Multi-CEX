@@ -9,7 +9,7 @@ from logging_config import get_trading_logger
 
 # Page configuration
 st.set_page_config(
-    page_title="Settings - AlgoTrader Pro",
+    page_title="Settings - AlgoTraderPro V2.0",
     page_icon="⚙️",
     layout="wide"
 )
@@ -217,6 +217,65 @@ with tab2:
             st.warning("🔒 Virtual Mode Only")
             st.caption("Add BYBIT_API_KEY and BYBIT_API_SECRET to .env for real trading")
 
+    st.markdown("---") # Separator
+
+    # API Key Input Section
+    with st.expander("🔑 API Credentials", expanded=True):
+        st.markdown(f"### {current_exchange.upper()} API Keys")
+
+        if current_exchange == "binance":
+            api_key = st.text_input(
+                "Binance API Key",
+                value=os.environ.get("BINANCE_API_KEY", ""),
+                type="password",
+                key="binance_api_key_input"
+            )
+            api_secret = st.text_input(
+                "Binance API Secret",
+                value=os.environ.get("BINANCE_API_SECRET", ""),
+                type="password",
+                key="binance_api_secret_input"
+            )
+
+            if st.button("💾 Save Binance API Keys", type="primary"):
+                if api_key and api_secret:
+                    if update_env_variable("BINANCE_API_KEY", api_key):
+                        if update_env_variable("BINANCE_API_SECRET", api_secret):
+                            st.success("✅ Binance API keys saved successfully! Please restart the app for changes to take effect.")
+                            st.info("Click the Stop button and then Run button to restart.")
+                else:
+                    st.error("Please provide both API Key and Secret")
+
+        elif current_exchange == "bybit":
+            api_key = st.text_input(
+                "Bybit API Key",
+                value=os.environ.get("BYBIT_API_KEY", ""),
+                type="password",
+                key="bybit_api_key_input"
+            )
+            api_secret = st.text_input(
+                "Bybit API Secret",
+                value=os.environ.get("BYBIT_API_SECRET", ""),
+                type="password",
+                key="bybit_api_secret_input"
+            )
+
+            if st.button("💾 Save Bybit API Keys", type="primary"):
+                if api_key and api_secret:
+                    if update_env_variable("BYBIT_API_KEY", api_key):
+                        if update_env_variable("BYBIT_API_SECRET", api_secret):
+                            st.success("✅ Bybit API keys saved successfully! Please restart the app for changes to take effect.")
+                            st.info("Click the Stop button and then Run button to restart.")
+                else:
+                    st.error("Please provide both API Key and Secret")
+
+    st.markdown("""
+    ### API Configuration
+
+    You can also use the Secrets tool (🔒) in the sidebar to add your API keys securely.
+    """)
+
+
 with tab3:
     st.markdown("### ⚠️ Risk Management")
 
@@ -297,12 +356,54 @@ with tab3:
 with tab4:
     st.markdown("### 🔔 Notification Settings")
 
-    notification_enabled = st.checkbox(
-        "Enable Notifications",
-        value=current_settings.get("NOTIFICATION_ENABLED", True)
-    )
+    # Notification Settings
+    with st.expander("🔔 Configure Notifications", expanded=False):
+        discord_webhook = st.text_input(
+            "Discord Webhook URL",
+            value=os.environ.get("DISCORD_WEBHOOK_URL", ""),
+            type="password",
+            key="discord_webhook_input"
+        )
 
-    st.info("📝 Configure notification channels in .env (Discord, Telegram, WhatsApp)")
+        telegram_bot_token = st.text_input(
+            "Telegram Bot Token",
+            value=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            type="password",
+            key="telegram_bot_token_input"
+        )
+
+        telegram_chat_id = st.text_input(
+            "Telegram Chat ID",
+            value=os.environ.get("TELEGRAM_CHAT_ID", ""),
+            key="telegram_chat_id_input"
+        )
+
+        whatsapp_to = st.text_input(
+            "WhatsApp To Number",
+            value=os.environ.get("WHATSAPP_TO", ""),
+            key="whatsapp_to_input"
+        )
+
+        if st.button("💾 Save Notification Settings", type="primary"):
+            success_count = 0
+            if discord_webhook:
+                if update_env_variable("DISCORD_WEBHOOK_URL", discord_webhook):
+                    success_count += 1
+            if telegram_bot_token:
+                if update_env_variable("TELEGRAM_BOT_TOKEN", telegram_bot_token):
+                    success_count += 1
+            if telegram_chat_id:
+                if update_env_variable("TELEGRAM_CHAT_ID", telegram_chat_id):
+                    success_count += 1
+            if whatsapp_to:
+                if update_env_variable("WHATSAPP_TO", whatsapp_to):
+                    success_count += 1
+
+            if success_count > 0:
+                st.success(f"✅ {success_count} notification setting(s) saved successfully!")
+            else:
+                st.warning("No notification settings to save")
+
 
 with tab5:
     st.markdown("### 🔧 System Configuration")

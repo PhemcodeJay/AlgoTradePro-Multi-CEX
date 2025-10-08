@@ -1,10 +1,18 @@
+
 [server]
-headless = true
+port = 5000
 address = "0.0.0.0"
-port = 5005
+headless = true
+enableCORS = true
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+serverAddress = "0.0.0.0"
+serverPort = 5000
 
 [theme]
-primaryColor = "#3383bdff"
+primaryColor = "#a8b7e7ff"
 backgroundColor = "#ffffff"
-secondaryBackgroundColor = "#b3c7f0ff"
-textColor = "#262730"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#1a1a1a"

@@ -6,13 +6,14 @@ from datetime import datetime, timezone, timedelta
 import time
 from db import DatabaseManager, WalletBalance
 from logging_config import get_trading_logger
+from utils import format_price, format_number
 
 # Initialize logger
 logger = get_trading_logger(__name__)
 
 # Page configuration
 st.set_page_config(
-    page_title="Dashboard - AlgoTrader Pro",
+    page_title="Dashboard - AlgoTraderPro V2.0",
     page_icon="📈",
     layout="wide"
 )
@@ -68,7 +69,7 @@ if selected_symbols:
                 st.warning(f"Failed to fetch price for {sym}: {str(e)}")
             
             with price_cols[i]:
-                value = f"${prices[sym]:.2f}" if isinstance(prices[sym], (int, float)) else prices[sym]
+                value = format_price(prices[sym]) if isinstance(prices[sym], (int, float)) else prices[sym]
                 st.metric(sym, value)
 else:
     st.info("Select symbols to display real-time prices")
@@ -96,8 +97,8 @@ try:
     with col1:
         st.metric(
             f"{account_type.title()} Balance",
-            f"${balance:,.2f}",
-            delta=f"{stats.get('total_pnl', 0):+.2f}",
+            format_price(balance),
+            delta=format_price(stats.get('total_pnl', 0)),
             help="Total account balance including unrealized P&L"
         )
     
@@ -149,7 +150,7 @@ with tab1:
                     'Symbol': signal.symbol,
                     'Side': signal.side,
                     'Score': f"{signal.score:.1f}",
-                    'Entry': f"${signal.entry:.6f}",
+                    'Entry': format_price(signal.entry, 6),
                     'Market': signal.market,
                     'Created': created_at.strftime('%Y-%m-%d %H:%M') if created_at is not None else 'N/A'
                 })
@@ -195,8 +196,8 @@ with tab2:
                     'Symbol': trade.symbol,
                     'Side': trade.side,
                     'Quantity': f"{trade.qty:.6f}",
-                    'Entry Price': f"${trade.entry_price:.6f}",
-                    'Current P&L': f"${current_pnl:.2f}",
+                    'Entry Price': format_price(trade.entry_price, 6),
+                    'Current P&L': format_price(current_pnl),
                     'Opened': created_at.strftime('%Y-%m-%d %H:%M') if created_at is not None else 'N/A'
                 })
 
@@ -313,11 +314,11 @@ with tab3:
                 col1, col2, col3, col4 = st.columns(4)
                 
                 with col1:
-                    st.metric("Best Trade", f"${max(daily_pnl):.2f}" if daily_pnl else "$0.00")
+                    st.metric("Best Trade", format_price(max(daily_pnl)) if daily_pnl else "$0.00")
                 with col2:
-                    st.metric("Worst Trade", f"${min(daily_pnl):.2f}" if daily_pnl else "$0.00")
+                    st.metric("Worst Trade", format_price(min(daily_pnl)) if daily_pnl else "$0.00")
                 with col3:
-                    st.metric("Avg Trade", f"${sum(daily_pnl)/len(daily_pnl):.2f}" if daily_pnl else "$0.00")
+                    st.metric("Avg Trade", format_price(sum(daily_pnl)/len(daily_pnl)) if daily_pnl else "$0.00")
                 with col4:
                     profitable_trades = len([p for p in daily_pnl if p > 0])
                     st.metric("Profitable %", f"{(profitable_trades/len(daily_pnl)*100):.1f}%" if daily_pnl else "0.0%")
