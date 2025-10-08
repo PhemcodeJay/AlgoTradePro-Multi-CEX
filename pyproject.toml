@@ -2,7 +2,7 @@
 name = "algotrader-pro"
 version = "0.1.0"
 description = "Cryptocurrency Algorithmic Trading Platform"
-requires-python = ">=3.11"
+requires-python = ">=3.12.6"
 dependencies = [
     "streamlit>=1.31.1",
     "sqlalchemy>=2.0.35",
