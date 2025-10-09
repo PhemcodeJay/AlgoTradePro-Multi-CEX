@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, timezone, timedelta
-from ..db import db_manager, Signal  # Relative import from project root
+from db import db_manager, Signal  # Absolute import
 from signal_generator import analyze_single_symbol, get_signal_summary, generate_signals
 from ml import MLFilter
 from logging_config import get_trading_logger
@@ -80,7 +80,7 @@ with col1:
                             liquidation=0.0,
                             leverage=result['leverage'],
                             margin_usdt=0.0,
-                            market=result['signal_type'].split('_')[0],  # e.g., 'mean_reversion' or 'trend_following'
+                            market=result['signal_type'].split('_')[0],
                             indicators=result['indicators'],
                             exchange=current_exchange
                         )
@@ -260,7 +260,7 @@ if filtered_signals:
         elif val.upper() in ['SELL', 'SHORT']:
             return 'color: red'
         return ''
-    styled_df = df.style.applymap(color_side, subset=['Side'])
+    styled_df = df.style.map(color_side, subset=['Side'])
     st.dataframe(styled_df, use_container_width=True, height=300)
 else:
     st.info("No signals found")
