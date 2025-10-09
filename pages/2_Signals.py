@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, timezone, timedelta
-from db import DatabaseManager, Signal
+from ..db import db_manager, Signal  # Relative import from project root
 from signal_generator import analyze_single_symbol, get_signal_summary, generate_signals
 from ml import MLFilter
 from logging_config import get_trading_logger
@@ -34,7 +34,6 @@ if 'trading_engine' not in st.session_state or 'current_exchange' not in st.sess
     st.stop()
 
 trading_engine = st.session_state.trading_engine
-db_manager = DatabaseManager()
 current_exchange = st.session_state.current_exchange
 account_type = st.session_state.get('account_type', 'virtual')
 
@@ -62,7 +61,7 @@ with col3:
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    if st.button("🔍 Analyze Symbol", type="primary", width="stretch"):
+    if st.button("🔍 Analyze Symbol", type="primary", use_container_width=True):
         if symbol_input:
             with st.spinner(f"Analyzing {symbol_input}..."):
                 try:
@@ -101,7 +100,7 @@ with col1:
                     logger.error(f"Analyze symbol error: {e}")
 
 with col2:
-    if st.button("🚀 Generate Signals", type="primary", width="stretch"):
+    if st.button("🚀 Generate Signals", type="primary", use_container_width=True):
         with st.spinner(f"Generating top {top_n} signals..."):
             try:
                 signals = generate_signals(
@@ -150,7 +149,7 @@ with col2:
                 logger.error(f"Signal generation error: {e}")
 
 with col3:
-    if st.button("📢 Send Notifications", width="stretch"):
+    if st.button("📢 Send Notifications", use_container_width=True):
         try:
             recent_signals = db_manager.get_signals(limit=10, exchange=current_exchange)
             if recent_signals:
@@ -164,7 +163,7 @@ with col3:
             logger.error(f"Notification error: {e}")
 
 with col4:
-    if st.button("🔄 Refresh", width="stretch"):
+    if st.button("🔄 Refresh", use_container_width=True):
         st.rerun()
 
 st.divider()
@@ -203,7 +202,7 @@ try:
                 hole=0.3
             )
             fig_pie.update_layout(height=300)
-            st.plotly_chart(fig_pie, width="stretch")
+            st.plotly_chart(fig_pie, use_container_width=True)
 
         with col2:
             market_counts = {}
@@ -217,7 +216,7 @@ try:
                 labels={'x': 'Signal Type', 'y': 'Count'}
             )
             fig_bar.update_layout(height=300)
-            st.plotly_chart(fig_bar, width="stretch")
+            st.plotly_chart(fig_bar, use_container_width=True)
     else:
         st.info("No recent signals available")
 except Exception as e:
@@ -235,25 +234,23 @@ with col1:
 with col2:
     side_filter = st.selectbox("Side", ["All", "Buy", "Sell"])
 
-filtered_signals = [s for s in recent_signals if (getattr(s, "score", 0) or 0) >= min_score]
+# Fetch signals and convert to dicts within session scope
+signal_dicts = [s.to_dict() for s in db_manager.get_signals(limit=100, exchange=current_exchange)]
+filtered_signals = [s for s in signal_dicts if s.get('score', 0.0) >= min_score]
 if side_filter != "All":
     buy_terms = ['BUY', 'LONG'] if side_filter == "Buy" else ['SELL', 'SHORT']
-    filtered_signals = [s for s in filtered_signals if (getattr(s, "side", "") or "").upper() in buy_terms]
+    filtered_signals = [s for s in filtered_signals if s.get('side', '').upper() in buy_terms]
 
 if filtered_signals:
     signal_data = []
     for signal in filtered_signals[:50]:
-        created_at = getattr(signal, "created_at", None)
-        created_str = created_at.strftime('%Y-%m-%d %H:%M') if isinstance(created_at, datetime) else 'N/A'
-        score_val = getattr(signal, "score", 0.0) or 0.0
-        entry_val = getattr(signal, "entry", 0.0) or 0.0
         signal_data.append({
-            'Symbol': getattr(signal, "symbol", "N/A"),
-            'Side': getattr(signal, "side", "N/A"),
-            'Score': f"{score_val:.1f}",
-            'Entry': f"${entry_val:.6f}",
-            'Signal Type': getattr(signal, "signal_type", "N/A"),
-            'Created': created_str
+            'Symbol': signal.get('symbol', 'N/A'),
+            'Side': signal.get('side', 'N/A'),
+            'Score': f"{signal.get('score', 0.0):.1f}",
+            'Entry': f"${signal.get('entry', 0.0):.6f}",
+            'Signal Type': signal.get('signal_type', 'N/A'),
+            'Created': signal.get('created_at', 'N/A')
         })
 
     df = pd.DataFrame(signal_data)
@@ -263,8 +260,8 @@ if filtered_signals:
         elif val.upper() in ['SELL', 'SHORT']:
             return 'color: red'
         return ''
-    styled_df = df.style.map(color_side, subset=['Side'])
-    st.dataframe(styled_df, width="stretch", height=300)
+    styled_df = df.style.applymap(color_side, subset=['Side'])
+    st.dataframe(styled_df, use_container_width=True, height=300)
 else:
     st.info("No signals found")
 
@@ -274,18 +271,16 @@ st.subheader("🔍 Signal Details")
 
 try:
     signal_keys = []
-    for s in filtered_signals:
-        created_at = getattr(s, "created_at", None)
-        created_time = created_at.strftime('%H:%M:%S') if isinstance(created_at, datetime) else "N/A"
-        signal_keys.append(f"{getattr(s, 'symbol', 'N/A')} - {created_time}")
+    for s in signal_dicts:
+        created_time = s.get('created_at', 'N/A').split('T')[1][:8] if s.get('created_at') != 'N/A' else 'N/A'
+        signal_keys.append(f"{s.get('symbol', 'N/A')} - {created_time}")
 
     selected_key = st.selectbox("Select signal for details", ["None"] + signal_keys)
     if selected_key != "None":
         selected_signal = None
-        for signal in filtered_signals:
-            created_at = getattr(signal, "created_at", None)
-            created_time = created_at.strftime('%H:%M:%S') if isinstance(created_at, datetime) else "N/A"
-            if f"{getattr(signal, 'symbol', 'N/A')} - {created_time}" == selected_key:
+        for signal in signal_dicts:
+            created_time = signal.get('created_at', 'N/A').split('T')[1][:8] if signal.get('created_at') != 'N/A' else 'N/A'
+            if f"{signal.get('symbol', 'N/A')} - {created_time}" == selected_key:
                 selected_signal = signal
                 break
 
@@ -293,18 +288,18 @@ try:
             col1, col2 = st.columns(2)
             with col1:
                 st.write("**Basic Information:**")
-                st.write(f"Symbol: {getattr(selected_signal, 'symbol', 'N/A')}")
-                st.write(f"Side: {getattr(selected_signal, 'side', 'N/A')}")
-                st.write(f"Score: {getattr(selected_signal, 'score', 0.0):.1f}")
-                st.write(f"Signal Type: {getattr(selected_signal, 'signal_type', 'N/A')}")
-                st.write(f"Entry Price: ${getattr(selected_signal, 'entry', 0.0):.6f}")
-                st.write(f"Take Profit: ${getattr(selected_signal, 'tp', 0.0):.6f}")
-                st.write(f"Stop Loss: ${getattr(selected_signal, 'sl', 0.0):.6f}")
-                st.write(f"Leverage: {getattr(selected_signal, 'leverage', 0)}x")
+                st.write(f"Symbol: {selected_signal.get('symbol', 'N/A')}")
+                st.write(f"Side: {selected_signal.get('side', 'N/A')}")
+                st.write(f"Score: {selected_signal.get('score', 0.0):.1f}")
+                st.write(f"Signal Type: {selected_signal.get('signal_type', 'N/A')}")
+                st.write(f"Entry Price: ${selected_signal.get('entry', 0.0):.6f}")
+                st.write(f"Take Profit: ${selected_signal.get('tp', 0.0):.6f}")
+                st.write(f"Stop Loss: ${selected_signal.get('sl', 0.0):.6f}")
+                st.write(f"Leverage: {selected_signal.get('leverage', 0)}x")
 
             with col2:
                 st.write("**Technical Indicators:**")
-                indicators = getattr(selected_signal, "indicators", {})
+                indicators = selected_signal.get('indicators', {})
                 if isinstance(indicators, dict):
                     for key, value in indicators.items():
                         if isinstance(value, (int, float)):
@@ -317,14 +312,14 @@ try:
             st.divider()
             col1, col2 = st.columns([1, 1])
             with col1:
-                if st.button("📈 Execute Virtual Trade", type="primary", width="stretch"):
+                if st.button("📈 Execute Virtual Trade", type="primary", use_container_width=True):
                     try:
                         if not trading_engine or not trading_engine.client:
                             st.error("Trading engine not properly initialized. Cannot execute trade.")
                         else:
-                            success = trading_engine.execute_virtual_trade(selected_signal.to_dict())
+                            success = trading_engine.execute_virtual_trade(selected_signal)
                             if success:
-                                st.success(f"Virtual trade executed for {getattr(selected_signal, 'symbol', 'N/A')}")
+                                st.success(f"Virtual trade executed for {selected_signal.get('symbol', 'N/A')}")
                             else:
                                 st.error("Failed to execute virtual trade")
                     except Exception as e:
@@ -332,10 +327,10 @@ try:
                         logger.error(f"Trade execution error: {e}")
 
             with col2:
-                if st.button("🔍 ML Analysis", width="stretch"):
+                if st.button("🔍 ML Analysis", use_container_width=True):
                     try:
                         ml_filter = MLFilter()
-                        indicators = getattr(selected_signal, "indicators", {})
+                        indicators = selected_signal.get('indicators', {})
                         if isinstance(indicators, dict):
                             features = ml_filter.prepare_features(indicators)
                             if features is not None and getattr(features, "size", 0) > 0 and ml_filter.model is not None:
@@ -367,19 +362,18 @@ st.subheader("📈 Signal Trends")
 
 try:
     week_ago = datetime.now(timezone.utc) - timedelta(days=7)
-    raw_signals = db_manager.get_signals(limit=500, exchange=current_exchange)
-    recent_signals = [s for s in raw_signals if isinstance(getattr(s, "created_at", None), datetime) and getattr(s, "created_at") > week_ago]
+    signal_dicts = [s.to_dict() for s in db_manager.get_signals(limit=500, exchange=current_exchange)]
+    recent_signals = [s for s in signal_dicts if s.get('created_at') and datetime.fromisoformat(s['created_at'].replace('Z', '+00:00')) > week_ago]
 
     if recent_signals:
         daily_counts = {}
         daily_avg_scores = {}
         for signal in recent_signals:
-            created_at = getattr(signal, "created_at", None)
-            if not isinstance(created_at, datetime):
+            if not signal.get('created_at'):
                 continue
-            date_key = created_at.date()
+            date_key = datetime.fromisoformat(signal['created_at'].replace('Z', '+00:00')).date()
             daily_counts[date_key] = daily_counts.get(date_key, 0) + 1
-            daily_avg_scores[date_key] = daily_avg_scores.get(date_key, []) + [getattr(signal, "score", 0.0) or 0.0]
+            daily_avg_scores[date_key] = daily_avg_scores.get(date_key, []) + [signal.get('score', 0.0)]
 
         for date_key in daily_avg_scores:
             scores = daily_avg_scores[date_key]
@@ -393,11 +387,11 @@ try:
         with col1:
             fig_counts = px.line(x=dates, y=counts, title="Daily Signal Count")
             fig_counts.update_layout(height=300)
-            st.plotly_chart(fig_counts, width="stretch")
+            st.plotly_chart(fig_counts, use_container_width=True)
         with col2:
             fig_scores = px.line(x=dates, y=avg_scores, title="Average Signal Score")
             fig_scores.update_layout(height=300)
-            st.plotly_chart(fig_scores, width="stretch")
+            st.plotly_chart(fig_scores, use_container_width=True)
     else:
         st.info("No recent signals for trend analysis")
 except Exception as e:

@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 import asyncio
 import threading
 import time
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 # Import core modules
 from db import db_manager
@@ -108,6 +108,62 @@ def initialize_app():
         st.error(f"Application initialization failed: {str(e)}")
         return False
 
+@st.cache_data
+def get_cached_dashboard_data(exchange: str, account_type: str, _is_virtual: bool) -> Dict[str, Any]:
+    """Fetch and cache dashboard data as plain dictionaries"""
+    with db_manager.get_session() as session:
+        try:
+            # Fetch signals
+            signals = db_manager.get_signals(limit=10, exchange=exchange) or []
+            signals_data = [s.to_dict() for s in signals]
+
+            # Fetch wallet balance
+            wallet = db_manager.get_wallet_balance(account_type=account_type, exchange=exchange)
+            wallet_data = wallet.to_dict() if wallet else {'available': 0.0}
+
+            # Fetch trades
+            open_trades = db_manager.get_trades(status='open', virtual=_is_virtual, exchange=exchange) or []
+            closed_trades = db_manager.get_trades(status='closed', virtual=_is_virtual, exchange=exchange) or []
+            open_trades_data = [t.to_dict() for t in open_trades]
+            closed_trades_data = [t.to_dict() for t in closed_trades]
+
+            return {
+                'signals': signals_data,
+                'wallet': wallet_data,
+                'open_trades': open_trades_data,
+                'closed_trades': closed_trades_data
+            }
+        except Exception as e:
+            logger.error(f"Error fetching cached dashboard data: {e}")
+            return {
+                'signals': [],
+                'wallet': {'available': 0.0},
+                'open_trades': [],
+                'closed_trades': []
+            }
+
+@st.cache_data
+def get_cached_signals(exchange: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch and cache recent signals as plain dictionaries"""
+    with db_manager.get_session() as session:
+        try:
+            signals = db_manager.get_signals(limit=limit, exchange=exchange) or []
+            return [s.to_dict() for s in signals]
+        except Exception as e:
+            logger.error(f"Error fetching cached signals: {e}")
+            return []
+
+@st.cache_data
+def get_cached_trades(exchange: str, _is_virtual: bool, limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch and cache recent trades as plain dictionaries"""
+    with db_manager.get_session() as session:
+        try:
+            trades = db_manager.get_trades(status='closed', virtual=_is_virtual, exchange=exchange, limit=limit) or []
+            return [t.to_dict() for t in trades]
+        except Exception as e:
+            logger.error(f"Error fetching cached trades: {e}")
+            return []
+
 def main():
     """Main application entry point"""
     
@@ -197,7 +253,6 @@ def main():
         with col2:
             has_api_keys = validate_env(current_exchange, allow_virtual=False)
             real_type = "primary" if account_type == "real" else "secondary"
-            # Ensure has_api_keys is a plain bool for disabled flag
             has_api_keys_bool = bool(has_api_keys)
             if st.button("💰 Real Trading", type=real_type, disabled=not has_api_keys_bool, use_container_width=True, key="mode_real"):
                 if account_type != "real":
@@ -270,15 +325,15 @@ def main():
 
         if st.session_state.trading_engine is not None:
             try:
-                wallet = db_manager.get_wallet_balance(account_type, exchange=current_exchange)
+                wallet = db_manager.get_wallet_balance(account_type=account_type, exchange=current_exchange)
                 stats = st.session_state.trading_engine.get_trade_statistics(account_type)
 
                 if wallet is not None:
-                    # Ensure numeric formatting won't break if wallet attributes are not numbers
                     available_val = to_float(wallet.available)
                     st.metric(f"{account_type.title()} Balance", f"${available_val:.2f}")
                 else:
-                    st.metric(f"{account_type.title()} Balance", "$0.00")
+                    two_decimals = float(0)
+                    st.metric(f"{account_type.title()} Balance", f"${two_decimals:.2f}")
 
                 col1, col2 = st.columns(2)
                 with col1:
@@ -308,20 +363,23 @@ def main():
     is_virtual = account_type == 'virtual'
     
     try:
-        recent_signals = db_manager.get_signals(limit=10, exchange=current_exchange) or []
-        wallet = db_manager.get_wallet_balance(account_type, exchange=current_exchange)
-        open_trades = db_manager.get_trades(status='open', virtual=is_virtual, exchange=current_exchange) or []
-        closed_trades = db_manager.get_trades(status='closed', virtual=is_virtual, exchange=current_exchange) or []
-        # Make sure created_at exists and is timezone-aware; wrap defensively
-        today_date = datetime.now(timezone.utc).date()
-        today_trades = [t for t in closed_trades if getattr(t, "created_at", None) is not None and t.created_at.date() == today_date]
-        today_pnl = sum((t.pnl or 0) for t in today_trades)
+        # Fetch cached dashboard data
+        dashboard_data = get_cached_dashboard_data(current_exchange, account_type, is_virtual)
+        signals = dashboard_data['signals']
+        wallet = dashboard_data['wallet']
+        open_trades = dashboard_data['open_trades']
+        closed_trades = dashboard_data['closed_trades']
+
+        # Calculate today's P&L
+        today_date = datetime.now(timezone.utc).date().isoformat()
+        today_trades = [t for t in closed_trades if t['created_at'].startswith(today_date)]
+        today_pnl = sum(t['pnl'] for t in today_trades)
 
         with col1:
-            recent_count = len(recent_signals)
+            recent_count = len(signals)
             last_scan = "Never"
-            if recent_count > 0 and getattr(recent_signals[0], "created_at", None) is not None:
-                last_scan = recent_signals[0].created_at.strftime('%H:%M')
+            if recent_count > 0 and signals[0]['created_at'] != 'N/A':
+                last_scan = signals[0]['created_at'].split(' ')[1][:5]  # Extract HH:MM
             st.metric("Recent Signals", recent_count, delta=f"Last scan: {last_scan}")
 
         with col2:
@@ -331,24 +389,17 @@ def main():
 
         with col3:
             balance_label = f"{account_type.title()} Balance"
-            if wallet is not None:
-                balance_value = f"${float(to_float(wallet.available)):.2f}"
-            else:
-                balance_value = "$0.00"
+            balance_value = f"${wallet['available']:.2f}"
             st.metric(balance_label, balance_value)
 
         with col4:
-            # Ensure today_pnl is a real float (not a SQLAlchemy column or None)
             pnl_value = float(to_float(today_pnl))
-
             pnl_delta = "➖"
             if pnl_value > 0:
                 pnl_delta = "📈"
             elif pnl_value < 0:
                 pnl_delta = "📉"
-
             st.metric("Today's P&L", f"${pnl_value:.2f}", delta=pnl_delta)
-
 
     except Exception as e:
         logger.error(f"Error loading dashboard metrics: {e}")
@@ -361,37 +412,22 @@ def main():
 
     with tab1:
         try:
-            signals = db_manager.get_signals(limit=5, exchange=current_exchange) or []
+            signals = get_cached_signals(current_exchange, limit=5)
             if len(signals) > 0:
                 for signal in signals:
                     with st.container():
                         col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
                         with col1:
-                            st.write(f"**{getattr(signal, 'symbol', 'N/A')}** - {getattr(signal, 'side', 'N/A')}")
-                            created_at = getattr(signal, "created_at", None)
-                            if created_at is not None:
-                                st.caption(f"Created: {created_at.strftime('%Y-%m-%d %H:%M')}")
-                            else:
-                                st.caption("Created: N/A")
+                            st.write(f"**{signal['symbol']}** - {signal['side']}")
+                            st.caption(f"Created: {signal['created_at']}")
                         with col2:
-                            score = getattr(signal, "score", 0.0)
-                            try:
-                                score_val = float(score)
-                            except Exception:
-                                score_val = 0.0
-                            st.metric("Score", f"{score_val:.1f}")
+                            st.metric("Score", f"{signal['score']:.1f}")
                         with col3:
-                            entry = getattr(signal, "entry", 0.0)
-                            try:
-                                entry_val = float(entry)
-                            except Exception:
-                                entry_val = 0.0
-                            st.metric("Entry", f"${entry_val:.6f}")
+                            st.metric("Entry", f"${signal['entry']:.6f}")
                         with col4:
-                            side_upper = (getattr(signal, "side", "") or "").upper()
+                            side_upper = signal['side'].upper()
                             color = "green" if side_upper in ["BUY", "LONG"] else "red"
-                            market = getattr(signal, "market", "N/A")
-                            st.markdown(f":{color}[{market}]")
+                            st.markdown(f":{color}[{signal['market']}]")
                         st.divider()
             else:
                 st.info("No recent signals found")
@@ -401,36 +437,21 @@ def main():
 
     with tab2:
         try:
-            recent_trades = db_manager.get_trades(status='closed', virtual=is_virtual, exchange=current_exchange, limit=5) or []
+            recent_trades = get_cached_trades(current_exchange, is_virtual, limit=5)
             if len(recent_trades) > 0:
-                # reverse to show newest first if needed
                 for trade in reversed(recent_trades):
                     with st.container():
                         col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
                         with col1:
-                            st.write(f"**{getattr(trade, 'symbol', 'N/A')}** - {getattr(trade, 'side', 'N/A')}")
-                            updated_at = getattr(trade, "updated_at", None)
-                            if updated_at is not None:
-                                st.caption(f"Closed: {updated_at.strftime('%Y-%m-%d %H:%M')}")
-                            else:
-                                st.caption("Closed: N/A")
+                            st.write(f"**{trade['symbol']}** - {trade['side']}")
+                            st.caption(f"Closed: {trade['updated_at']}")
                         with col2:
-                            qty = getattr(trade, "qty", 0.0)
-                            try:
-                                qty_val = float(qty)
-                            except Exception:
-                                qty_val = 0.0
-                            st.metric("Qty", f"{qty_val:.6f}")
+                            st.metric("Qty", f"{trade['qty']:.6f}")
                         with col3:
-                            pnl = getattr(trade, "pnl", 0.0) or 0.0
-                            try:
-                                pnl_val = float(pnl)
-                            except Exception:
-                                pnl_val = 0.0
-                            st.metric("P&L", f"${pnl_val:.2f}")
+                            st.metric("P&L", f"${trade['pnl']:.2f}")
                         with col4:
-                            color = "green" if pnl_val > 0 else "red" if pnl_val < 0 else "gray"
-                            label = "Profit" if pnl_val > 0 else "Loss" if pnl_val < 0 else "Break Even"
+                            color = "green" if trade['pnl'] > 0 else "red" if trade['pnl'] < 0 else "gray"
+                            label = "Profit" if trade['pnl'] > 0 else "Loss" if trade['pnl'] < 0 else "Break Even"
                             st.markdown(f":{color}[{label}]")
                         st.divider()
             else:
@@ -441,6 +462,7 @@ def main():
 
     # Auto-refresh
     if st.button("🔄 Refresh Dashboard"):
+        st.cache_data.clear()  # Clear cache on refresh
         st.rerun()
 
     # Footer

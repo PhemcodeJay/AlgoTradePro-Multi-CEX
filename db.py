@@ -21,14 +21,14 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False, pool_size=1
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 ScopedSession = scoped_session(SessionLocal)  # Thread-safe session factory
 
-# Models (unchanged from provided version)
+# Models
 class Signal(Base):
     __tablename__ = "signals"
 
     id = Column(Integer, primary_key=True, index=True)
     symbol = Column(String(20), nullable=False, index=True)
     interval = Column(String(10), nullable=False)
-    signal_type = Column(String(50), nullable=False)  # Increased length for signal_type
+    signal_type = Column(String(50), nullable=False)
     side = Column(String(10), nullable=False)
     score = Column(Float, nullable=False)
     entry = Column(Float, nullable=False)
@@ -61,7 +61,7 @@ class Signal(Base):
             'market': self.market,
             'indicators': self.indicators,
             'exchange': self.exchange,
-            'created_at': self.created_at.isoformat() if self.created_at else None
+            'created_at': self.created_at.isoformat() if self.created_at is not None else None
         }
 
 class Trade(Base):
@@ -110,8 +110,8 @@ class Trade(Base):
             'order_id': self.order_id,
             'error_message': self.error_message,
             'indicators': self.indicators,
-            'created_at': self.created_at.isoformat() if self.created_at else None,
-            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+            'created_at': self.created_at.isoformat() if self.created_at is not None else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at is not None else None
         }
 
 class WalletBalance(Base):
@@ -135,7 +135,7 @@ class WalletBalance(Base):
             'total': self.total,
             'currency': self.currency,
             'exchange': self.exchange,
-            'updated_at': self.updated_at.isoformat() if self.updated_at else None
+            'updated_at': self.updated_at.isoformat() if self.updated_at is not None else None
         }
 
 class Settings(Base):
@@ -163,7 +163,7 @@ class FeedbackModel(Base):
             'id': self.id,
             'symbol': self.symbol,
             'exchange': self.exchange,
-            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'timestamp': self.timestamp.isoformat() if self.timestamp is not None else None,
             'outcome': self.outcome,
             'pnl': self.pnl,
             'indicators': self.indicators
@@ -187,7 +187,7 @@ class ErrorLog(Base):
             'message': self.message,
             'error_code': self.error_code,
             'context': self.context,
-            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
+            'timestamp': self.timestamp.isoformat() if self.timestamp is not None else None,
             'trading_mode': self.trading_mode
         }
 
@@ -260,7 +260,7 @@ class DatabaseManager:
                     for key, value in updates.items():
                         if hasattr(trade, key):
                             setattr(trade, key, value)
-                    trade.updated_at = datetime.now(timezone.utc)
+                    trade.updated_at = datetime.now(timezone.utc)  # type: ignore
                     session.commit()
                     logger.debug(f"Trade {trade_id} updated")
                     return True
@@ -310,12 +310,12 @@ class DatabaseManager:
             try:
                 wallet = session.query(WalletBalance).filter(WalletBalance.account_type == account_type).first()
                 if wallet:
-                    wallet.available = available
-                    wallet.used = used
-                    wallet.total = available + used
+                    wallet.available = available  # type: ignore
+                    wallet.used = used  # type: ignore
+                    wallet.total = available + used  # type: ignore
                     if exchange:
-                        wallet.exchange = exchange
-                    wallet.updated_at = datetime.now(timezone.utc)
+                        wallet.exchange = exchange  # type: ignore
+                    wallet.updated_at = datetime.now(timezone.utc)  # type: ignore
                 else:
                     wallet = WalletBalance(
                         account_type=account_type,
