@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import time
 from typing import List, Dict, Any, Optional
+from signal_generator import convert_np_types
 from logging_config import get_trading_logger
 from binance_client import BinanceClient
 from bybit_client import BybitClient
@@ -132,6 +133,15 @@ def calculate_volume_ratio(df: pd.DataFrame, short_period: int = 5, long_period:
     vol_long = df['volume'].rolling(window=long_period).mean()
     return vol_short / vol_long
 
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Calculate Average True Range (ATR)"""
+    high_low = df['high'].astype('float64') - df['low'].astype('float64')
+    high_close = abs(df['high'].astype('float64') - df['close'].astype('float64').shift())
+    low_close = abs(df['low'].astype('float64') - df['close'].astype('float64').shift())
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = true_range.rolling(window=period).mean()
+    return atr
+
 def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Dict[str, Any]:
     """Analyze a single symbol using combined mean reversion and trend-following strategies"""
     try:
@@ -148,12 +158,14 @@ def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Dict[st
         rsi = calculate_rsi(df, 14)
         macd_data = calculate_macd(df)
         volume_ratio = calculate_volume_ratio(df)
+        atr = calculate_atr(df, 14)
         
         # Check for valid indicator values
         if any(pd.isna([
             sma_200.iloc[-1], ema_9.iloc[-1], bb_data['bb_upper'].iloc[-1],
             stoch_rsi_data['stoch_rsi_k'].iloc[-1], rsi.iloc[-1],
-            macd_data['macd_histogram'].iloc[-1], volume_ratio.iloc[-1]
+            macd_data['macd_histogram'].iloc[-1], volume_ratio.iloc[-1],
+            atr.iloc[-1]
         ])):
             logger.warning(f"Invalid indicator values for {symbol}")
             return {}
@@ -243,12 +255,13 @@ def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Dict[st
         logger.debug(f"{symbol} RSI: {rsi.iloc[-1]:.2f}, Stoch_RSI_K: {stoch_rsi_data['stoch_rsi_k'].iloc[-1]:.2f}, "
                      f"MACD_Hist: {macd_data['macd_histogram'].iloc[-1]:.6f}, Price: {current_price:.6f}, "
                      f"SMA200: {sma_200.iloc[-1]:.6f}, EMA9: {ema_9.iloc[-1]:.6f}, "
-                     f"BB_Position: {bb_position:.2f}, Volume_Ratio: {volume_ratio.iloc[-1]:.2f}")
+                     f"BB_Position: {bb_position:.2f}, Volume_Ratio: {volume_ratio.iloc[-1]:.2f}, "
+                     f"ATR: {atr.iloc[-1]:.6f}")
         logger.info(f"Signal for {symbol}: {signal_type}, Side: {side}, MR_Score: {mr_score}, TF_Score: {tf_score}, "
                     f"Total_Score: {total_score}, Conditions: {mr_conditions + tf_conditions}")
         
         indicators = {
-            'price': current_price,
+            'price': float(current_price),
             'sma_200': float(sma_200.iloc[-1]),
             'ema_9': float(ema_9.iloc[-1]),
             'rsi': float(rsi.iloc[-1]),
@@ -261,9 +274,10 @@ def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Dict[st
             'bb_middle': float(bb_data['bb_middle'].iloc[-1]),
             'bb_lower': float(bb_data['bb_lower'].iloc[-1]),
             'volume_ratio': float(volume_ratio.iloc[-1]),
-            'price_change_1h': df['close'].pct_change(periods=1).iloc[-1] * 100 if len(df) > 1 else 0,
-            'price_change_4h': df['close'].pct_change(periods=4).iloc[-1] * 100 if len(df) > 4 else 0,
-            'price_change_24h': df['close'].pct_change(periods=24).iloc[-1] * 100 if len(df) > 24 else 0
+            'atr': float(atr.iloc[-1]),
+            'price_change_1h': float(df['close'].pct_change(periods=1).iloc[-1] * 100 if len(df) > 1 else 0),
+            'price_change_4h': float(df['close'].pct_change(periods=4).iloc[-1] * 100 if len(df) > 4 else 0),
+            'price_change_24h': float(df['close'].pct_change(periods=24).iloc[-1] * 100 if len(df) > 24 else 0)
         }
         
         return {
@@ -275,9 +289,9 @@ def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Dict[st
             'tf_score': tf_score,
             'indicators': indicators,
             'timestamp': latest.isoformat(),
-            'entry': current_price,
-            'tp': current_price * 1.02 if side == "BUY" else current_price * 0.98,
-            'sl': current_price * 0.98 if side == "BUY" else current_price * 1.02,
+            'entry': float(current_price),
+            'tp': float(current_price * 1.02 if side == "BUY" else current_price * 0.98),
+            'sl': float(current_price * 0.98 if side == "BUY" else current_price * 1.02),
             'leverage': 1
         }
     except Exception as e:
@@ -311,7 +325,7 @@ def scan_multiple_symbols(exchange: str, symbols: List[str], timeframe: str = '1
                 logger.error(f"Error processing {symbol}: {e}")
     
     logger.info(f"Analyzed {len(results)}/{len(symbols)} symbols")
-    return results
+    return [convert_np_types(result) for result in results]
 
 def get_market_overview(exchange: str) -> Dict[str, Any]:
     """Get general market overview"""
@@ -323,10 +337,10 @@ def get_market_overview(exchange: str) -> Dict[str, Any]:
         eth_ticker = exchange_client.fetch_ticker('ETH/USDT')
         
         return {
-            'btc_price': btc_ticker['last'],
-            'btc_change_24h': btc_ticker['percentage'],
-            'eth_price': eth_ticker['last'],
-            'eth_change_24h': eth_ticker['percentage'],
+            'btc_price': float(btc_ticker['last']),
+            'btc_change_24h': float(btc_ticker['percentage']),
+            'eth_price': float(eth_ticker['last']),
+            'eth_change_24h': float(eth_ticker['percentage']),
             'timestamp': time.time()
         }
         

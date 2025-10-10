@@ -2,11 +2,23 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, timezone, timedelta
-from db import db_manager  # Removed Signal import
+from typing import Dict, Any, List, Optional, Union
+from db import db_manager, Signal
 from signal_generator import analyze_single_symbol, get_signal_summary, generate_signals
 from ml import MLFilter
 from logging_config import get_trading_logger
 from notifications import send_all_notifications
+import numpy as np
+
+# Utility function to convert np.float64 to float recursively
+def convert_np_types(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {k: convert_np_types(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [convert_np_types(item) for item in data]
+    elif isinstance(data, np.float64):
+        return float(data)
+    return data
 
 # Page configuration
 st.set_page_config(
@@ -68,23 +80,27 @@ with col1:
                     result = analyze_single_symbol(current_exchange, symbol_input.upper(), interval)
                     if isinstance(result, dict) and result.get('symbol'):
                         signal = {
-                            'symbol': result['symbol'],
-                            'interval': interval,
-                            'signal_type': result['signal_type'],
-                            'side': result['side'],
-                            'score': result['score'],
-                            'entry': result['entry'],
-                            'sl': result['sl'],
-                            'tp': result['tp'],
-                            'trail': 0.0,
-                            'liquidation': 0.0,
-                            'leverage': result['leverage'],
-                            'margin_usdt': 0.0,
-                            'market': result['signal_type'].split('_')[0],
-                            'indicators': result['indicators'],
-                            'exchange': current_exchange
+                            'symbol': str(result.get('symbol', '')),
+                            'interval': str(interval),
+                            'signal_type': str(result.get('signal_type', 'neutral')),
+                            'side': str(result.get('side', 'HOLD')),
+                            'score': float(result.get('score', 0.0)),
+                            'entry': float(result.get('entry', 0.0)),
+                            'sl': float(result.get('sl', 0.0)),
+                            'tp': float(result.get('tp', 0.0)),
+                            'trail': float(result.get('trail', 0.0)),
+                            'liquidation': float(result.get('liquidation', 0.0)),
+                            'leverage': int(result.get('leverage', 1)),
+                            'margin_usdt': float(result.get('margin_usdt', 0.0)),
+                            'market': str(result.get('signal_type', 'neutral').split('_')[0]),
+                            'indicators': convert_np_types(result.get('indicators', {})),
+                            'exchange': str(current_exchange),
+                            'created_at': str(result.get('created_at', datetime.now(timezone.utc).isoformat()))
                         }
-                        if db_manager.add_signal(signal):
+                        if not isinstance(signal['indicators'], dict):
+                            logger.error(f"Invalid indicators for {symbol_input}: {signal['indicators']}")
+                            st.warning(f"⚠️ Invalid indicator data for {symbol_input}")
+                        elif db_manager.add_signal(signal):
                             st.success(f"✅ Signal generated and saved for {symbol_input}")
                             st.rerun()
                         else:
@@ -112,22 +128,26 @@ with col2:
                 for result in signals:
                     if result.get('side') != "HOLD":
                         signal = {
-                            'symbol': result['symbol'],
-                            'interval': interval,
-                            'signal_type': result['signal_type'],
-                            'side': result['side'],
-                            'score': result['score'],
-                            'entry': result['entry'],
-                            'sl': result['sl'],
-                            'tp': result['tp'],
-                            'trail': 0.0,
-                            'liquidation': 0.0,
-                            'leverage': result['leverage'],
-                            'margin_usdt': 0.0,
-                            'market': result['signal_type'].split('_')[0],
-                            'indicators': result['indicators'],
-                            'exchange': current_exchange
+                            'symbol': str(result.get('symbol', '')),
+                            'interval': str(interval),
+                            'signal_type': str(result.get('signal_type', 'neutral')),
+                            'side': str(result.get('side', 'HOLD')),
+                            'score': float(result.get('score', 0.0)),
+                            'entry': float(result.get('entry', 0.0)),
+                            'sl': float(result.get('sl', 0.0)),
+                            'tp': float(result.get('tp', 0.0)),
+                            'trail': float(result.get('trail', 0.0)),
+                            'liquidation': float(result.get('liquidation', 0.0)),
+                            'leverage': int(result.get('leverage', 1)),
+                            'margin_usdt': float(result.get('margin_usdt', 0.0)),
+                            'market': str(result.get('signal_type', 'neutral').split('_')[0]),
+                            'indicators': convert_np_types(result.get('indicators', {})),
+                            'exchange': str(current_exchange),
+                            'created_at': str(result.get('created_at', datetime.now(timezone.utc).isoformat()))
                         }
+                        if not isinstance(signal['indicators'], dict):
+                            logger.error(f"Invalid indicators for {signal['symbol']}: {signal['indicators']}")
+                            continue
                         if db_manager.add_signal(signal):
                             saved_signals += 1
                 if saved_signals > 0:
