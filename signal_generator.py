@@ -13,16 +13,6 @@ logger = get_logger(__name__)
 
 TRADING_MODE = os.getenv("TRADING_MODE", "virtual").lower()
 
-# Utility function to convert np.float64 to float recursively
-def convert_np_types(data: Any) -> Any:
-    if isinstance(data, dict):
-        return {k: convert_np_types(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [convert_np_types(item) for item in data]
-    elif isinstance(data, np.float64):
-        return float(data)
-    return data
-
 def get_symbols(exchange: str, limit: int = 50) -> List[str]:
     usdt_symbols = [
         "BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT",
@@ -75,6 +65,16 @@ def calculate_signal_score(analysis: Dict[str, Any]) -> float:
     trend_score = float(indicators.get("trend_score", 0))
     score += trend_score * 3
     return min(100, max(0, score))
+
+# Utility function to convert np.float64 to float recursively
+def convert_np_types(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {k: convert_np_types(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [convert_np_types(item) for item in data]
+    elif isinstance(data, np.float64):
+        return float(data)
+    return data
 
 def enhance_signal(analysis: Dict[str, Any]) -> Dict[str, Any]:
     # Validate analysis

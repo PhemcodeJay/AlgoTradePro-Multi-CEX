@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import time
 from typing import List, Dict, Any, Optional
-from signal_generator import convert_np_types
 from logging_config import get_trading_logger
 from binance_client import BinanceClient
 from bybit_client import BybitClient
@@ -22,6 +21,16 @@ def get_client(exchange: str) -> Any:
         else:
             raise ValueError(f"Unsupported exchange: {exchange}")
     return _client_cache[exchange]
+
+# Utility function to convert np.float64 to float recursively
+def convert_np_types(data: Any) -> Any:
+    if isinstance(data, dict):
+        return {k: convert_np_types(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [convert_np_types(item) for item in data]
+    elif isinstance(data, np.float64):
+        return float(data)
+    return data
 
 def get_top_symbols(exchange: str, limit: int = 50) -> List[str]:
     """Get top USDT trading pairs by volume using custom client"""
