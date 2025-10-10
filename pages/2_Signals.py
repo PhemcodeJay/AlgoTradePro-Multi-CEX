@@ -73,7 +73,7 @@ with col3:
 col1, col2, col3, col4 = st.columns(4)
 
 with col1:
-    if st.button("🔍 Analyze Symbol", type="primary", use_container_width=True):
+    if st.button("🔍 Analyze Symbol", type="primary", width=True):
         if symbol_input:
             with st.spinner(f"Analyzing {symbol_input}..."):
                 try:
@@ -116,7 +116,7 @@ with col1:
                     logger.error(f"Analyze symbol error: {e}")
 
 with col2:
-    if st.button("🚀 Generate Signals", type="primary", use_container_width=True):
+    if st.button("🚀 Generate Signals", type="primary", width=True):
         with st.spinner(f"Generating top {top_n} signals..."):
             try:
                 signals = generate_signals(
@@ -169,7 +169,7 @@ with col2:
                 logger.error(f"Signal generation error: {e}")
 
 with col3:
-    if st.button("📢 Send Notifications", use_container_width=True):
+    if st.button("📢 Send Notifications", width=True):
         try:
             signal_dicts = db_manager.get_signals(limit=10, exchange=current_exchange)
             if signal_dicts:
@@ -182,7 +182,7 @@ with col3:
             logger.error(f"Notification error: {e}")
 
 with col4:
-    if st.button("🔄 Refresh", use_container_width=True):
+    if st.button("🔄 Refresh", width=True):
         st.rerun()
 
 st.divider()
@@ -220,7 +220,7 @@ try:
                 hole=0.3
             )
             fig_pie.update_layout(height=300)
-            st.plotly_chart(fig_pie, use_container_width=True)
+            st.plotly_chart(fig_pie, width=True)
 
         with col2:
             market_counts = {}
@@ -234,7 +234,7 @@ try:
                 labels={'x': 'Signal Type', 'y': 'Count'}
             )
             fig_bar.update_layout(height=300)
-            st.plotly_chart(fig_bar, use_container_width=True)
+            st.plotly_chart(fig_bar, width=True)
     else:
         st.info("No recent signals available")
 except Exception as e:
@@ -279,7 +279,7 @@ if filtered_signals:
             return 'color: red'
         return ''
     styled_df = df.style.map(color_side, subset=['Side'])
-    st.dataframe(styled_df, use_container_width=True, height=300)
+    st.dataframe(styled_df, width=True, height=300)
 else:
     st.info("No signals found")
 
@@ -331,7 +331,7 @@ try:
             st.divider()
             col1, col2 = st.columns([1, 1])
             with col1:
-                if st.button("📈 Execute Virtual Trade", type="primary", use_container_width=True):
+                if st.button("📈 Execute Virtual Trade", type="primary", width=True):
                     try:
                         if not trading_engine or not trading_engine.client:
                             st.error("Trading engine not properly initialized. Cannot execute trade.")
@@ -346,7 +346,7 @@ try:
                         logger.error(f"Trade execution error: {e}")
 
             with col2:
-                if st.button("🔍 ML Analysis", use_container_width=True):
+                if st.button("🔍 ML Analysis", width=True):
                     try:
                         ml_filter = MLFilter()
                         indicators = selected_signal.get('indicators', {})
@@ -406,11 +406,11 @@ try:
         with col1:
             fig_counts = px.line(x=dates, y=counts, title="Daily Signal Count")
             fig_counts.update_layout(height=300)
-            st.plotly_chart(fig_counts, use_container_width=True)
+            st.plotly_chart(fig_counts, width=True)
         with col2:
             fig_scores = px.line(x=dates, y=avg_scores, title="Average Signal Score")
             fig_scores.update_layout(height=300)
-            st.plotly_chart(fig_scores, use_container_width=True)
+            st.plotly_chart(fig_scores, width=True)
     else:
         st.info("No recent signals for trend analysis")
 except Exception as e:
