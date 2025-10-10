@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from datetime import datetime, timezone, timedelta
-from db import db_manager, Signal  # Absolute import
+from db import db_manager  # Removed Signal import
 from signal_generator import analyze_single_symbol, get_signal_summary, generate_signals
 from ml import MLFilter
 from logging_config import get_trading_logger
@@ -67,23 +67,23 @@ with col1:
                 try:
                     result = analyze_single_symbol(current_exchange, symbol_input.upper(), interval)
                     if isinstance(result, dict) and result.get('symbol'):
-                        signal = Signal(
-                            symbol=result['symbol'],
-                            interval=interval,
-                            signal_type=result['signal_type'],
-                            side=result['side'],
-                            score=result['score'],
-                            entry=result['entry'],
-                            sl=result['sl'],
-                            tp=result['tp'],
-                            trail=0.0,
-                            liquidation=0.0,
-                            leverage=result['leverage'],
-                            margin_usdt=0.0,
-                            market=result['signal_type'].split('_')[0],
-                            indicators=result['indicators'],
-                            exchange=current_exchange
-                        )
+                        signal = {
+                            'symbol': result['symbol'],
+                            'interval': interval,
+                            'signal_type': result['signal_type'],
+                            'side': result['side'],
+                            'score': result['score'],
+                            'entry': result['entry'],
+                            'sl': result['sl'],
+                            'tp': result['tp'],
+                            'trail': 0.0,
+                            'liquidation': 0.0,
+                            'leverage': result['leverage'],
+                            'margin_usdt': 0.0,
+                            'market': result['signal_type'].split('_')[0],
+                            'indicators': result['indicators'],
+                            'exchange': current_exchange
+                        }
                         if db_manager.add_signal(signal):
                             st.success(f"✅ Signal generated and saved for {symbol_input}")
                             st.rerun()
@@ -111,23 +111,23 @@ with col2:
                 saved_signals = 0
                 for result in signals:
                     if result.get('side') != "HOLD":
-                        signal = Signal(
-                            symbol=result['symbol'],
-                            interval=interval,
-                            signal_type=result['signal_type'],
-                            side=result['side'],
-                            score=result['score'],
-                            entry=result['entry'],
-                            sl=result['sl'],
-                            tp=result['tp'],
-                            trail=0.0,
-                            liquidation=0.0,
-                            leverage=result['leverage'],
-                            margin_usdt=0.0,
-                            market=result['signal_type'].split('_')[0],
-                            indicators=result['indicators'],
-                            exchange=current_exchange
-                        )
+                        signal = {
+                            'symbol': result['symbol'],
+                            'interval': interval,
+                            'signal_type': result['signal_type'],
+                            'side': result['side'],
+                            'score': result['score'],
+                            'entry': result['entry'],
+                            'sl': result['sl'],
+                            'tp': result['tp'],
+                            'trail': 0.0,
+                            'liquidation': 0.0,
+                            'leverage': result['leverage'],
+                            'margin_usdt': 0.0,
+                            'market': result['signal_type'].split('_')[0],
+                            'indicators': result['indicators'],
+                            'exchange': current_exchange
+                        }
                         if db_manager.add_signal(signal):
                             saved_signals += 1
                 if saved_signals > 0:
@@ -151,9 +151,8 @@ with col2:
 with col3:
     if st.button("📢 Send Notifications", use_container_width=True):
         try:
-            recent_signals = db_manager.get_signals(limit=10, exchange=current_exchange)
-            if recent_signals:
-                signal_dicts = [s.to_dict() for s in recent_signals]
+            signal_dicts = db_manager.get_signals(limit=10, exchange=current_exchange)
+            if signal_dicts:
                 send_all_notifications(signal_dicts)
                 st.success(f"Notifications sent for {len(signal_dicts)} signals!")
             else:
@@ -172,9 +171,8 @@ st.divider()
 st.subheader("📊 Signal Statistics")
 
 try:
-    recent_signals = db_manager.get_signals(limit=100, exchange=current_exchange)
-    if recent_signals:
-        signal_dicts = [s.to_dict() for s in recent_signals]
+    signal_dicts = db_manager.get_signals(limit=100, exchange=current_exchange)
+    if signal_dicts:
         summary = get_signal_summary(signal_dicts)
 
         col1, col2, col3 = st.columns(3)
@@ -234,8 +232,8 @@ with col1:
 with col2:
     side_filter = st.selectbox("Side", ["All", "Buy", "Sell"])
 
-# Fetch signals and convert to dicts within session scope
-signal_dicts = [s.to_dict() for s in db_manager.get_signals(limit=100, exchange=current_exchange)]
+# Fetch signals as dicts
+signal_dicts = db_manager.get_signals(limit=100, exchange=current_exchange)
 filtered_signals = [s for s in signal_dicts if s.get('score', 0.0) >= min_score]
 if side_filter != "All":
     buy_terms = ['BUY', 'LONG'] if side_filter == "Buy" else ['SELL', 'SHORT']
@@ -270,6 +268,7 @@ st.divider()
 st.subheader("🔍 Signal Details")
 
 try:
+    signal_dicts = db_manager.get_signals(limit=100, exchange=current_exchange)
     signal_keys = []
     for s in signal_dicts:
         created_time = s.get('created_at', 'N/A').split('T')[1][:8] if s.get('created_at') != 'N/A' else 'N/A'
@@ -362,7 +361,7 @@ st.subheader("📈 Signal Trends")
 
 try:
     week_ago = datetime.now(timezone.utc) - timedelta(days=7)
-    signal_dicts = [s.to_dict() for s in db_manager.get_signals(limit=500, exchange=current_exchange)]
+    signal_dicts = db_manager.get_signals(limit=500, exchange=current_exchange)
     recent_signals = [s for s in signal_dicts if s.get('created_at') and datetime.fromisoformat(s['created_at'].replace('Z', '+00:00')) > week_ago]
 
     if recent_signals:

@@ -1,7 +1,8 @@
 import os
 import json
 from datetime import datetime, timezone
-from typing import List, Optional, Dict, Any
+from signal_generator import Signal
+from typing import List, Optional, Dict, Any, Union
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, scoped_session
@@ -219,24 +220,47 @@ class DatabaseManager:
     def create_tables(self):
         Base.metadata.create_all(bind=self.engine)
 
-    def add_signal(self, signal: Signal) -> bool:
+    def add_signal(self, signal: Union[Signal, Dict[str, Any]]) -> bool:
         with self.get_session() as session:
             try:
-                session.add(signal)
+                if isinstance(signal, dict):
+                    signal_obj = Signal(
+                        symbol=signal['symbol'],
+                        interval=signal['interval'],
+                        signal_type=signal['signal_type'],
+                        side=signal['side'],
+                        score=signal['score'],
+                        entry=signal['entry'],
+                        sl=signal['sl'],
+                        tp=signal['tp'],
+                        trail=signal.get('trail', 0.0),
+                        liquidation=signal.get('liquidation', 0.0),
+                        leverage=signal['leverage'],
+                        margin_usdt=signal.get('margin_usdt', 0.0),
+                        market=signal['market'],
+                        indicators=signal['indicators'],
+                        exchange=signal['exchange'],
+                        created_at=datetime.now(timezone.utc)
+                    )
+                else:
+                    signal_obj = signal
+                session.add(signal_obj)
                 session.commit()
-                logger.debug(f"Signal added for {signal.symbol}")
+                logger.debug(f"Signal added for {signal_obj.symbol}")
                 return True
             except SQLAlchemyError as e:
-                logger.error(f"Error adding signal for {signal.symbol}: {e}")
+                logger.error(f"Error adding signal for {signal_obj.symbol}: {e}")
                 return False
 
-    def get_signals(self, limit: int = 10, exchange: Optional[str] = None) -> List[Signal]:
+    def get_signals(self, limit: int = 10, exchange: Optional[str] = None) -> List[Dict[str, Any]]:
         with self.get_session() as session:
             try:
                 query = session.query(Signal).order_by(Signal.created_at.desc())
                 if exchange:
                     query = query.filter(Signal.exchange == exchange)
-                return query.limit(limit).all()
+                signals = query.limit(limit).all()
+                # Convert to dicts within the session
+                return [signal.to_dict() for signal in signals]
             except SQLAlchemyError as e:
                 logger.error(f"Error fetching signals: {e}")
                 return []
