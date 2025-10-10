@@ -1,7 +1,6 @@
 import os
 import json
 from datetime import datetime, timezone
-from signal_generator import Signal
 from typing import List, Optional, Dict, Any, Union
 from sqlalchemy import create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, JSON
 from sqlalchemy.ext.declarative import declarative_base
