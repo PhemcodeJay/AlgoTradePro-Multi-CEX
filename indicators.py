@@ -1,367 +1,452 @@
-import ccxt
-import pandas as pd
-import numpy as np
+from typing import Dict, List, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
-from typing import List, Dict, Any, Optional
-from logging_config import get_trading_logger
-from binance_client import BinanceClient
-from bybit_client import BybitClient
+import numpy as np
+import requests
+from utils import get_symbol_precision, round_to_precision
 
-logger = get_trading_logger(__name__)
+# Logging using centralized system
+from logging_config import get_logger
+logger = get_logger(__name__)
 
-_client_cache = {}
-def get_client(exchange: str) -> Any:
-    """Get or reuse the appropriate client based on exchange"""
-    exchange = exchange.lower()
-    if exchange not in _client_cache:
-        if exchange == "binance":
-            _client_cache[exchange] = BinanceClient()
-        elif exchange == "bybit":
-            _client_cache[exchange] = BybitClient()
+# Constants
+INTERVALS = ["1", "3", "5", "15", "30", "60", "120", "240", "360", "720", "D", "W"]
+ML_ENABLED = True  # Feature flag for ML filtering
+
+# Blacklist for high-volatility or low-quality assets (e.g., meme coins like 1000SATS)
+BLACKLIST_SYMBOLS = ["1000SATSUSDT"]  # Add more as needed, e.g., based on patterns or known volatile assets
+
+def get_candles(symbol: str, interval: str, limit: int = 200, retries: int = 3) -> List[Dict]:
+    """Fetch candlestick data from Bybit API with retries"""
+    time.sleep(0.1)  # Small delay to avoid rate limits
+    for attempt in range(retries):
+        try:
+            url = "https://api.bybit.com/v5/market/kline"
+            params = {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": interval,
+                "limit": str(limit)
+            }
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            
+            if data.get("retCode") == 0 and "result" in data:
+                klines = []
+                tick_size = get_symbol_precision(symbol)
+                for k in data["result"]["list"]:
+                    klines.append({
+                        "time": int(k[0]),
+                        "open": round_to_precision(float(k[1]), tick_size),
+                        "high": round_to_precision(float(k[2]), tick_size),
+                        "low": round_to_precision(float(k[3]), tick_size),
+                        "close": round_to_precision(float(k[4]), tick_size),
+                        "volume": float(k[5])
+                    })
+                return sorted(klines, key=lambda x: x["time"])
+            logger.warning(f"Invalid response for {symbol}: {data.get('retMsg', 'No message')}")
+            return []
+        except Exception as e:
+            logger.error(f"Attempt {attempt + 1}/{retries} failed for {symbol}: {e}")
+            if attempt < retries - 1:
+                time.sleep(1)  # Wait before retrying
+            continue
+    logger.error(f"Failed to fetch candles for {symbol} after {retries} attempts")
+    return []
+
+def sma(prices: List[float], period: int) -> List[float]:
+    """Simple Moving Average"""
+    if len(prices) < period:
+        return [0] * len(prices)
+    
+    sma_values = []
+    for i in range(len(prices)):
+        if i < period - 1:
+            sma_values.append(0)
         else:
-            raise ValueError(f"Unsupported exchange: {exchange}")
-    return _client_cache[exchange]
+            avg = sum(prices[i-period+1:i+1]) / period
+            sma_values.append(avg)
+    return sma_values
 
-# Utility function to convert np.float64 to float recursively
-def convert_np_types(data: Any) -> Any:
-    if isinstance(data, dict):
-        return {k: convert_np_types(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [convert_np_types(item) for item in data]
-    elif isinstance(data, np.float64):
-        return float(data)
-    return data
+def ema(prices: List[float], period: int) -> List[float]:
+    """Exponential Moving Average"""
+    if len(prices) < period:
+        return [0] * len(prices)
+    
+    multiplier = 2 / (period + 1)
+    ema_values = [prices[0]]  # Start with first price
+    
+    for i in range(1, len(prices)):
+        ema_val = (prices[i] * multiplier) + (ema_values[-1] * (1 - multiplier))
+        ema_values.append(ema_val)
+    
+    return ema_values
 
-def get_top_symbols(exchange: str, limit: int = 50) -> List[str]:
-    """Get top USDT trading pairs by volume using custom client"""
-    fallback_symbols = [
-        "BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT",
-        "BNBUSDT", "AVAXUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT",
-        "MATICUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "XLMUSDT",
-        "TRXUSDT", "VETUSDT", "ALGOUSDT"
-    ]
-    symbols = list(dict.fromkeys(fallback_symbols))[:limit]
-    logger.info(f"Using predefined {len(symbols)} USDT symbols for {exchange}")
-    return symbols
-
-def fetch_klines(exchange: str, symbol: str, timeframe: str = '1h', limit: int = 500) -> Optional[pd.DataFrame]:
-    """Fetch klines/candles for a symbol using custom client"""
-    try:
-        client = get_client(exchange)
-        timeframe_map = {
-            '1h': '60', '4h': '240', '1d': '1440',
-            '60': '60', '240': '240', '1440': '1440'
-        }
-        interval = timeframe_map.get(timeframe, '60')
-        
-        klines = client.get_klines(symbol, interval, limit)
-        logger.debug(f"Fetched {len(klines)} klines for {symbol}: {klines[:2] if klines else []}")
-        
-        if not klines:
-            logger.warning(f"No data received for {symbol}")
-            return None
-        
-        df = pd.DataFrame(klines)
-        logger.debug(f"Raw DataFrame for {symbol}: {df.head(2).to_dict()}")
-        
-        required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required_columns):
-            logger.error(f"Missing required columns in klines for {symbol}: {df.columns}")
-            return None
-        
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        
-        nan_count = df.isna().sum().sum()
-        if nan_count > 0:
-            logger.warning(f"Dropping {nan_count} rows with NaN values for {symbol}")
-            df.dropna(inplace=True)
-        
-        if df.empty:
-            logger.warning(f"DataFrame empty after cleaning for {symbol}")
-            return None
-        
-        logger.info(f"Processed DataFrame for {symbol} with {len(df)} rows")
-        return df
-    except Exception as e:
-        error_msg = str(e)
-        if "403" in error_msg or "Forbidden" in error_msg or "451" in error_msg or "restricted location" in error_msg:
-            logger.warning(f"API access restricted for {symbol}. This may be due to geographical restrictions.")
+def rsi(prices: List[float], period: int = 14) -> List[float]:
+    """Relative Strength Index"""
+    if len(prices) < period + 1:
+        return [50.0] * len(prices)
+    
+    gains = []
+    losses = []
+    
+    for i in range(1, len(prices)):
+        change = prices[i] - prices[i-1]
+        if change > 0:
+            gains.append(change)
+            losses.append(0.0)
         else:
-            logger.error(f"Error fetching klines for {symbol}: {e}")
-        return None
+            gains.append(0.0)
+            losses.append(abs(change))
+    
+    rsi_values = [50.0]  # Start with neutral RSI
+    
+    for i in range(period, len(gains)):
+        avg_gain = sum(gains[i-period:i]) / period
+        avg_loss = sum(losses[i-period:i]) / period
+        
+        if avg_loss == 0:
+            rsi_val = 100
+        else:
+            rs = avg_gain / avg_loss
+            rsi_val = 100 - (100 / (1 + rs))
+        
+        rsi_values.append(rsi_val)
+    
+    while len(rsi_values) < len(prices):
+        rsi_values.insert(0, 50.0)
+    
+    return rsi_values
 
-def calculate_sma(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """Calculate Simple Moving Average"""
-    return df['close'].astype('float64').rolling(window=period).mean()
+def stochastic_rsi(prices: List[float], period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> Dict[str, List[float]]:
+    """Stochastic RSI"""
+    if len(prices) < period + 1:
+        zero_list = [50.0] * len(prices)
+        return {"stoch_rsi": zero_list, "k": zero_list, "d": zero_list}
+    
+    rsi_values = rsi(prices, period)
+    stoch_rsi = []
+    
+    for i in range(period - 1, len(rsi_values)):
+        rsi_slice = rsi_values[i-period+1:i+1]
+        if not rsi_slice:
+            stoch_rsi.append(50.0)
+            continue
+        lowest_rsi = min(rsi_slice)
+        highest_rsi = max(rsi_slice)
+        if highest_rsi == lowest_rsi:
+            stoch_rsi.append(50.0)
+        else:
+            stoch_val = 100 * (rsi_values[i] - lowest_rsi) / (highest_rsi - lowest_rsi)
+            stoch_rsi.append(stoch_val)
+    
+    while len(stoch_rsi) < len(prices):
+        stoch_rsi.insert(0, 50.0)
+    
+    k_values = sma(stoch_rsi, smooth_k)
+    d_values = sma(k_values, smooth_d)
+    
+    return {
+        "stoch_rsi": stoch_rsi,
+        "k": k_values,
+        "d": d_values
+    }
 
-def calculate_ema(df: pd.DataFrame, period: int = 20) -> pd.Series:
-    """Calculate Exponential Moving Average"""
-    return df['close'].astype('float64').ewm(span=period, adjust=False).mean()
+def bollinger_bands(prices: List[float], period: int = 20, std_dev: float = 2) -> Dict[str, List[float]]:
+    """Bollinger Bands"""
+    if len(prices) < period:
+        zero_list = [0.0] * len(prices)
+        return {"upper": zero_list, "middle": zero_list, "lower": zero_list}
+    
+    sma_values = sma(prices, period)
+    
+    upper_band = []
+    lower_band = []
+    
+    for i in range(len(prices)):
+        if i < period - 1:
+            upper_band.append(0.0)
+            lower_band.append(0.0)
+        else:
+            price_slice = prices[i-period+1:i+1]
+            std = np.std(price_slice)
+            upper_band.append(sma_values[i] + (std * std_dev))
+            lower_band.append(sma_values[i] - (std * std_dev))
+    
+    return {
+        "upper": upper_band,
+        "middle": sma_values,
+        "lower": lower_band
+    }
 
-def calculate_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculate Relative Strength Index"""
-    delta = df['close'].astype('float64').diff()
-    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+def atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> List[float]:
+    """Average True Range"""
+    if len(highs) < period:
+        return [0.0] * len(highs)
+    
+    tr_values = []
+    for i in range(len(highs)):
+        if i == 0:
+            tr = highs[0] - lows[0]
+        else:
+            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        tr_values.append(tr)
+    
+    atr_values = sma(tr_values, period)
+    return atr_values
 
-def calculate_stoch_rsi(df: pd.DataFrame, period: int = 14, smooth_k: int = 3, smooth_d: int = 3) -> pd.DataFrame:
-    """Calculate Stochastic RSI"""
-    rsi = calculate_rsi(df, period)
-    stoch_rsi = (rsi - rsi.rolling(window=period).min()) / (rsi.rolling(window=period).max() - rsi.rolling(window=period).min() + 1e-10) * 100
-    k = stoch_rsi.rolling(window=smooth_k).mean()
-    d = k.rolling(window=smooth_d).mean()
-    return pd.DataFrame({'stoch_rsi_k': k, 'stoch_rsi_d': d})
-
-def calculate_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
-    """Calculate MACD"""
-    ema_fast = calculate_ema(df, fast)
-    ema_slow = calculate_ema(df, slow)
-    macd = ema_fast - ema_slow
-    macd_signal = macd.ewm(span=signal, adjust=False).mean()
-    macd_hist = macd - macd_signal
-    return pd.DataFrame({'macd': macd, 'macd_signal': macd_signal, 'macd_histogram': macd_hist})
-
-def calculate_bb(df: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> pd.DataFrame:
-    """Calculate Bollinger Bands"""
-    sma = calculate_sma(df, period)
-    std = df['close'].astype('float64').rolling(window=period).std()
-    upper = sma + std * std_dev
-    lower = sma - std * std_dev
-    return pd.DataFrame({'bb_upper': upper, 'bb_lower': lower, 'bb_middle': sma})
-
-def calculate_volume_ratio(df: pd.DataFrame, short_period: int = 5, long_period: int = 20) -> pd.Series:
-    """Calculate volume ratio"""
-    vol_short = df['volume'].rolling(window=short_period).mean()
-    vol_long = df['volume'].rolling(window=long_period).mean()
-    return vol_short / vol_long
-
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Calculate Average True Range (ATR)"""
-    high_low = df['high'].astype('float64') - df['low'].astype('float64')
-    high_close = abs(df['high'].astype('float64') - df['close'].astype('float64').shift())
-    low_close = abs(df['low'].astype('float64') - df['close'].astype('float64').shift())
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = true_range.rolling(window=period).mean()
-    return atr
-
-def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Dict[str, Any]:
-    """Analyze a single symbol using combined mean reversion and trend-following strategies"""
+def calculate_indicators(candles: List[Dict]) -> Dict[str, Any]:
+    """Calculate technical indicators (SMA 20, SMA 200, EMA 9, EMA 21, Bollinger Bands, RSI, Stochastic RSI, Volume, ATR)"""
     try:
-        df = fetch_klines(exchange, symbol, timeframe)
-        if df is None or len(df) < 200:
-            logger.warning(f"Insufficient data for {symbol}: {len(df) if df is not None else 0} rows")
+        if not candles or len(candles) < 200:
             return {}
         
-        # Calculate indicators
-        sma_200 = calculate_sma(df, 200)
-        ema_9 = calculate_ema(df, 9)
-        bb_data = calculate_bb(df, 20)
-        stoch_rsi_data = calculate_stoch_rsi(df, 14)
-        rsi = calculate_rsi(df, 14)
-        macd_data = calculate_macd(df)
-        volume_ratio = calculate_volume_ratio(df)
-        atr = calculate_atr(df, 14)
+        closes = [c["close"] for c in candles]
+        highs = [c["high"] for c in candles]
+        lows = [c["low"] for c in candles]
+        volumes = [c["volume"] for c in candles]
         
-        # Check for valid indicator values
-        if any(pd.isna([
-            sma_200.iloc[-1], ema_9.iloc[-1], bb_data['bb_upper'].iloc[-1],
-            stoch_rsi_data['stoch_rsi_k'].iloc[-1], rsi.iloc[-1],
-            macd_data['macd_histogram'].iloc[-1], volume_ratio.iloc[-1],
-            atr.iloc[-1]
-        ])):
-            logger.warning(f"Invalid indicator values for {symbol}")
+        # Moving averages
+        sma_20 = sma(closes, 20)
+        sma_200 = sma(closes, 200)
+        ema_9 = ema(closes, 9)
+        ema_21 = ema(closes, 21)
+        
+        # Momentum indicators
+        rsi_14 = rsi(closes, 14)
+        stoch_rsi_data = stochastic_rsi(closes, period=14, smooth_k=3, smooth_d=3)
+        
+        # Volatility indicators
+        bb_data = bollinger_bands(closes, period=20, std_dev=2)
+        
+        # ATR for dynamic SL/TP
+        atr_14 = atr(highs, lows, closes, 14)
+        
+        # Current values (last in arrays)
+        current_price = closes[-1]
+        current_sma_20 = sma_20[-1] if sma_20[-1] != 0 else None
+        current_sma_200 = sma_200[-1] if sma_200[-1] != 0 else None
+        current_ema_9 = ema_9[-1] if ema_9[-1] != 0 else None
+        current_ema_21 = ema_21[-1] if ema_21[-1] != 0 else None
+        current_rsi = rsi_14[-1] if rsi_14 else 50
+        current_stoch_k = stoch_rsi_data["k"][-1] if stoch_rsi_data["k"] else 50
+        current_stoch_d = stoch_rsi_data["d"][-1] if stoch_rsi_data["d"] else 50
+        current_bb_upper = bb_data["upper"][-1] if bb_data["upper"] else 0
+        current_bb_lower = bb_data["lower"][-1] if bb_data["lower"] else 0
+        current_volume = volumes[-1] if volumes else 0
+        current_atr = atr_14[-1] if atr_14 else 0
+        
+        # Skip if any key indicator is invalid (e.g., defaults due to insufficient data)
+        if None in [current_sma_20, current_sma_200, current_ema_9, current_ema_21] or current_atr == 0:
+            logger.warning("Incomplete indicators, skipping asset")
             return {}
         
-        current_price = df['close'].iloc[-1]
-        latest = df.index[-1]
+        # Volume analysis
+        avg_volume = sum(volumes[-20:]) / min(20, len(volumes)) if volumes else 0
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
         
-        # Mean Reversion Signals
-        mr_score = 0
-        mr_conditions = []
-        
-        # Bollinger Bands: Price near lower/upper band
-        bb_width = (bb_data['bb_upper'].iloc[-1] - bb_data['bb_lower'].iloc[-1]) / bb_data['bb_middle'].iloc[-1]
-        bb_position = (current_price - bb_data['bb_lower'].iloc[-1]) / (bb_data['bb_upper'].iloc[-1] - bb_data['bb_lower'].iloc[-1] + 1e-10)
-        if bb_position < 0.1 and bb_width < 0.1:  # Price near lower band, narrow bands
-            mr_score += 30
-            mr_conditions.append("BB_lower")
-        elif bb_position > 0.9 and bb_width < 0.1:  # Price near upper band, narrow bands
-            mr_score += 30
-            mr_conditions.append("BB_upper")
-        
-        # Stochastic RSI: Overbought/oversold
-        if stoch_rsi_data['stoch_rsi_k'].iloc[-1] < 20 and stoch_rsi_data['stoch_rsi_k'].iloc[-1] > stoch_rsi_data['stoch_rsi_d'].iloc[-1]:
-            mr_score += 25
-            mr_conditions.append("Stoch_RSI_oversold")
-        elif stoch_rsi_data['stoch_rsi_k'].iloc[-1] > 80 and stoch_rsi_data['stoch_rsi_k'].iloc[-1] < stoch_rsi_data['stoch_rsi_d'].iloc[-1]:
-            mr_score += 25
-            mr_conditions.append("Stoch_RSI_overbought")
-        
-        # RSI: Overbought/oversold
-        if rsi.iloc[-1] < 30:
-            mr_score += 20
-            mr_conditions.append("RSI_oversold")
-        elif rsi.iloc[-1] > 70:
-            mr_score += 20
-            mr_conditions.append("RSI_overbought")
-        
-        # Trend-Following Signals
-        tf_score = 0
-        tf_conditions = []
-        
-        # 200 SMA and 9 EMA alignment
-        if current_price > sma_200.iloc[-1] and ema_9.iloc[-1] > sma_200.iloc[-1]:
-            tf_score += 30
-            tf_conditions.append("Price_above_SMA200_EMA9")
-        elif current_price < sma_200.iloc[-1] and ema_9.iloc[-1] < sma_200.iloc[-1]:
-            tf_score += 30
-            tf_conditions.append("Price_below_SMA200_EMA9")
-        
-        # MACD: Trend confirmation
-        if macd_data['macd'].iloc[-1] > macd_data['macd_signal'].iloc[-1] and macd_data['macd_histogram'].iloc[-1] > 0:
-            tf_score += 25
-            tf_conditions.append("MACD_bullish")
-        elif macd_data['macd'].iloc[-1] < macd_data['macd_signal'].iloc[-1] and macd_data['macd_histogram'].iloc[-1] < 0:
-            tf_score += 25
-            tf_conditions.append("MACD_bearish")
-        
-        # Volume confirmation
-        volume_score = 0
-        if volume_ratio.iloc[-1] > 1.5:
-            volume_score += 20
-            mr_conditions.append("High_volume")
-            tf_conditions.append("High_volume")
-        
-        # Combine scores
-        total_score = mr_score + tf_score + volume_score
-        signal_type = "neutral"
-        side = "HOLD"
-        
-        # Mean Reversion: BUY if oversold, SELL if overbought
-        if mr_score >= 50 and "BB_lower" in mr_conditions and ("Stoch_RSI_oversold" in mr_conditions or "RSI_oversold" in mr_conditions):
-            signal_type = "mean_reversion_bullish"
-            side = "BUY"
-        elif mr_score >= 50 and "BB_upper" in mr_conditions and ("Stoch_RSI_overbought" in mr_conditions or "RSI_overbought" in mr_conditions):
-            signal_type = "mean_reversion_bearish"
-            side = "SELL"
-        
-        # Trend-Following: BUY if bullish trend, SELL if bearish trend
-        elif tf_score >= 50 and "Price_above_SMA200_EMA9" in tf_conditions and "MACD_bullish" in tf_conditions:
-            signal_type = "trend_following_bullish"
-            side = "BUY"
-        elif tf_score >= 50 and "Price_below_SMA200_EMA9" in tf_conditions and "MACD_bearish" in tf_conditions:
-            signal_type = "trend_following_bearish"
-            side = "SELL"
-        
-        # Log details for debugging
-        logger.debug(f"{symbol} RSI: {rsi.iloc[-1]:.2f}, Stoch_RSI_K: {stoch_rsi_data['stoch_rsi_k'].iloc[-1]:.2f}, "
-                     f"MACD_Hist: {macd_data['macd_histogram'].iloc[-1]:.6f}, Price: {current_price:.6f}, "
-                     f"SMA200: {sma_200.iloc[-1]:.6f}, EMA9: {ema_9.iloc[-1]:.6f}, "
-                     f"BB_Position: {bb_position:.2f}, Volume_Ratio: {volume_ratio.iloc[-1]:.2f}, "
-                     f"ATR: {atr.iloc[-1]:.6f}")
-        logger.info(f"Signal for {symbol}: {signal_type}, Side: {side}, MR_Score: {mr_score}, TF_Score: {tf_score}, "
-                    f"Total_Score: {total_score}, Conditions: {mr_conditions + tf_conditions}")
-        
-        indicators = {
-            'price': float(current_price),
-            'sma_200': float(sma_200.iloc[-1]),
-            'ema_9': float(ema_9.iloc[-1]),
-            'rsi': float(rsi.iloc[-1]),
-            'stoch_rsi_k': float(stoch_rsi_data['stoch_rsi_k'].iloc[-1]),
-            'stoch_rsi_d': float(stoch_rsi_data['stoch_rsi_d'].iloc[-1]),
-            'macd': float(macd_data['macd'].iloc[-1]),
-            'macd_signal': float(macd_data['macd_signal'].iloc[-1]),
-            'macd_histogram': float(macd_data['macd_histogram'].iloc[-1]),
-            'bb_upper': float(bb_data['bb_upper'].iloc[-1]),
-            'bb_middle': float(bb_data['bb_middle'].iloc[-1]),
-            'bb_lower': float(bb_data['bb_lower'].iloc[-1]),
-            'volume_ratio': float(volume_ratio.iloc[-1]),
-            'atr': float(atr.iloc[-1]),
-            'price_change_1h': float(df['close'].pct_change(periods=1).iloc[-1] * 100 if len(df) > 1 else 0),
-            'price_change_4h': float(df['close'].pct_change(periods=4).iloc[-1] * 100 if len(df) > 4 else 0),
-            'price_change_24h': float(df['close'].pct_change(periods=24).iloc[-1] * 100 if len(df) > 24 else 0)
-        }
+        # Trend analysis with short-term downtrend check for profitability
+        trend_score = 0
+        if len(sma_20) > 1 and len(sma_200) > 1:
+            if sma_20[-1] > sma_200[-1]:
+                trend_score += 1
+            if closes[-1] > sma_20[-1]:
+                trend_score += 1
+            if sma_20[-1] > sma_20[-2]:
+                trend_score += 1
+            if ema_9[-1] > ema_21[-1]:
+                trend_score += 1
+        # Reduce trend score if recent 10-period price change is negative (to avoid buy in downtrends)
+        if len(closes) >= 10:
+            recent_change = (closes[-1] - closes[-10]) / closes[-10] * 100
+            if recent_change < 0:
+                trend_score -= 1  # Penalize for short-term downtrend
         
         return {
-            'symbol': symbol,
-            'signal_type': signal_type,
-            'side': side,
-            'score': total_score,
-            'mr_score': mr_score,
-            'tf_score': tf_score,
-            'indicators': indicators,
-            'timestamp': latest.isoformat(),
-            'entry': float(current_price),
-            'tp': float(current_price * 1.02 if side == "BUY" else current_price * 0.98),
-            'sl': float(current_price * 0.98 if side == "BUY" else current_price * 1.02),
-            'leverage': 1
+            "price": current_price,
+            "sma_20": current_sma_20,
+            "sma_200": current_sma_200,
+            "ema_9": current_ema_9,
+            "ema_21": current_ema_21,
+            "rsi": current_rsi,
+            "stoch_k": current_stoch_k,
+            "stoch_d": current_stoch_d,
+            "bb_upper": current_bb_upper,
+            "bb_lower": current_bb_lower,
+            "bb_middle": bb_data["middle"][-1] if bb_data["middle"] else current_price,
+            "volume": current_volume,
+            "volume_ratio": volume_ratio,
+            "trend_score": max(0, trend_score),  # Ensure non-negative
+            "volatility": ((current_bb_upper - current_bb_lower) / current_price * 100) if current_price > 0 else 0,
+            "atr": current_atr
         }
+        
+    except Exception as e:
+        logger.error(f"Error calculating indicators: {e}")
+        return {}
+
+def get_top_symbols(limit: int = 50) -> List[str]:
+    try:
+        url = "https://api.bybit.com/v5/market/tickers"
+        params = {"category": "linear"}
+        
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        if data.get("retCode") == 0 and "result" in data:
+            tickers = data["result"]["list"]
+            
+            usdt_pairs = []
+            for ticker in tickers:
+                symbol = ticker.get("symbol", "")
+                if symbol.endswith("USDT") and symbol not in BLACKLIST_SYMBOLS:
+                    volume = float(ticker.get("volume24h", 0))
+                    price = float(ticker.get("lastPrice", 0))
+                    turnover = float(ticker.get("turnover24h", 0))
+                    # Additional filter: skip very low-price assets (e.g., <0.001) prone to high volatility
+                    if volume > 100000 and price > 0.001 and turnover > 100000:
+                        usdt_pairs.append({
+                            "symbol": symbol,
+                            "volume": volume,
+                            "price": price
+                        })
+            
+            usdt_pairs.sort(key=lambda x: x["volume"], reverse=True)
+            symbols = [pair["symbol"] for pair in usdt_pairs[:limit]]
+            logger.info(f"Top {len(symbols)} symbols fetched: {symbols}")
+            return symbols
+        
+        return []
+    except Exception as e:
+        logger.error(f"Error getting top symbols: {e}")
+        return ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT"]
+
+def analyze_symbol(symbol: str, interval: str = "60") -> Dict[str, Any]:
+    """Comprehensive analysis of a single symbol"""
+    try:
+        candles = get_candles(symbol, interval, 200)
+        if not candles:
+            return {}
+        
+        indicators = calculate_indicators(candles)
+        if not indicators:
+            return {}
+        
+        # Generate signal score based on indicators
+        score = 0
+        signals = []
+        
+        # Price vs Moving Averages
+        price = indicators.get("price", 0)
+        sma_20 = indicators.get("sma_20", price)
+        sma_200 = indicators.get("sma_200", price)
+        ema_9 = indicators.get("ema_9", price)
+        ema_21 = indicators.get("ema_21", price)
+        
+        if price > sma_200 and ema_9 > ema_21:
+            score += 20
+            signals.append("BULLISH_MA_CROSS")
+        elif price < sma_200 and ema_9 < ema_21:
+            score += 20
+            signals.append("BEARISH_MA_CROSS")  # Fixed typo from original
+        
+        # RSI signals (tightened for profitability in volatile markets)
+        rsi = indicators.get("rsi", 50)
+        if rsi < 25:  # Tightened from 30
+            score += 20
+            signals.append("RSI_OVERSOLD")
+        elif rsi > 75:  # Tightened from 70 for overbought
+            score += 20
+            signals.append("RSI_OVERBOUGHT")
+        
+        # Stochastic RSI signals (tightened)
+        stoch_k = indicators.get("stoch_k", 50)
+        stoch_d = indicators.get("stoch_d", 50)
+        if stoch_k < 15 and stoch_k > stoch_d:  # Tightened from 20
+            score += 20
+            signals.append("STOCH_RSI_OVERSOLD")
+        elif stoch_k > 85 and stoch_k < stoch_d:  # Tightened from 80
+            score += 20
+            signals.append("STOCH_RSI_OVERBOUGHT")
+        
+        # Bollinger Bands signals
+        bb_upper = indicators.get("bb_upper", 0)
+        bb_lower = indicators.get("bb_lower", 0)
+        if price <= bb_lower:
+            score += 15
+            signals.append("BB_OVERSOLD")
+        elif price >= bb_upper:
+            score += 15
+            signals.append("BB_OVERBOUGHT")
+        
+        # Volume confirmation
+        volume_ratio = indicators.get("volume_ratio", 1)
+        if volume_ratio > 1.5:
+            score += 10
+            signals.append("VOLUME_HIGH")
+        
+        # Trend confirmation
+        trend_score = indicators.get("trend_score", 0)
+        if trend_score >= 3:
+            score += 15
+            signals.append("TREND_BULLISH")
+        elif trend_score <= 1:
+            score += 15
+            signals.append("TREND_BEARISH")
+        
+        # Determine signal type and side
+        signal_type = "neutral"
+        side = "Buy"
+        
+        if any(s in signals for s in ["RSI_OVERSOLD", "STOCH_RSI_OVERSOLD", "BB_OVERSOLD", "BULLISH_MA_CROSS"]) and "TREND_BULLISH" in signals:
+            signal_type = "buy"
+            side = "Buy"
+        elif any(s in signals for s in ["RSI_OVERBOUGHT", "STOCH_RSI_OVERBOUGHT", "BB_OVERBOUGHT", "BEARISH_MA_CROSS"]) and "TREND_BEARISH" in signals:
+            signal_type = "sell"
+            side = "Sell"
+        
+        return {
+            "symbol": symbol,
+            "interval": interval,
+            "score": min(score, 100),
+            "signal_type": signal_type,
+            "side": side,
+            "entry": price,
+            "indicators": indicators,
+            "signals": signals,
+            "analysis_time": time.time()
+        }
+        
     except Exception as e:
         logger.error(f"Error analyzing {symbol}: {e}")
         return {}
 
-def analyze_single_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Dict[str, Any]:
-    """Wrapper for analyzing a single symbol"""
-    return analyze_symbol(exchange, symbol, timeframe)
-
-def scan_multiple_symbols(exchange: str, symbols: List[str], timeframe: str = '1h', max_workers: int = 5) -> List[Dict[str, Any]]:
-    """Scan multiple symbols in parallel"""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    results = []
-    
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_symbol = {
-            executor.submit(analyze_symbol, exchange, symbol, timeframe): symbol 
-            for symbol in symbols
-        }
-        
-        for future in as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            try:
-                result = future.result(timeout=30)
-                if result:
-                    results.append(result)
-                else:
-                    logger.warning(f"No result for {symbol}")
-            except Exception as e:
-                logger.error(f"Error processing {symbol}: {e}")
-    
-    logger.info(f"Analyzed {len(results)}/{len(symbols)} symbols")
-    return [convert_np_types(result) for result in results]
-
-def get_market_overview(exchange: str) -> Dict[str, Any]:
-    """Get general market overview"""
+def scan_multiple_symbols(symbols: List[str], interval: str = "60", max_workers: int = 10, timeout: int = 120) -> List[Dict]:
     try:
-        client = get_client(exchange)
-        exchange_client = client.exchange
-        
-        btc_ticker = exchange_client.fetch_ticker('BTC/USDT')
-        eth_ticker = exchange_client.fetch_ticker('ETH/USDT')
-        
-        return {
-            'btc_price': float(btc_ticker['last']),
-            'btc_change_24h': float(btc_ticker['percentage']),
-            'eth_price': float(eth_ticker['last']),
-            'eth_change_24h': float(eth_ticker['percentage']),
-            'timestamp': time.time()
-        }
-        
+        results = []
+        unfinished = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_symbol = {
+                executor.submit(analyze_symbol, symbol, interval): symbol
+                for symbol in symbols
+            }
+            for future in as_completed(future_to_symbol, timeout=timeout):
+                symbol = future_to_symbol[future]
+                try:
+                    result = future.result()
+                    if result and result.get("score", 0) > 0:
+                        results.append(result)
+                except Exception as e:
+                    logger.error(f"Error analyzing {symbol}: {e}")
+            unfinished = [symbol for future, symbol in future_to_symbol.items() if not future.done()]
+            if unfinished:
+                logger.warning(f"Error scanning symbols: {len(unfinished)} (of {len(symbols)}) futures unfinished: {unfinished}")
+        if len(results) < len(symbols):
+            logger.warning(f"Only {len(results)} of {len(symbols)} symbols analyzed successfully")
+        results.sort(key=lambda x: x.get("score", 0), reverse=True)
+        return results
     except Exception as e:
-        logger.error(f"Error fetching market overview: {e}")
-        return {}
-
-if __name__ == "__main__":
-    # Test the indicators
-    exchange = "binance"
-    symbols = get_top_symbols(exchange, 5)
-    results = scan_multiple_symbols(exchange, symbols)
-    
-    for result in results:
-        print(f"{result['symbol']}: Score {result['score']}, Side: {result['side']}")
+        logger.error(f"Error scanning symbols: {e}")
+        return []
