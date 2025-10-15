@@ -1,333 +1,479 @@
-from dotenv import load_dotenv
-load_dotenv()
-
 import streamlit as st
-from datetime import datetime
+import os
+import sys
+from datetime import datetime, timezone
+import asyncio
+import threading
+import time
+from typing import Dict, Any, List
+
+# Import core modules
 from db import db_manager
-from logging_config import get_logger
-from bybit_client import BybitClient
+from settings import load_settings, validate_env, save_settings
+from logging_config import get_trading_logger
+from multi_trading_engine import TradingEngine
+from automated_trader import AutomatedTrader
 
-# Logging using centralized system
-logger = get_logger(__name__)
-
-# Configure Streamlit page
+# Configure page
 st.set_page_config(
-    page_title="AlgoTrader Pro",
-    page_icon="🚀",
+    page_title="AlgoTraderPro - MultiEX",
+    page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# --- Session State Initialization ---
-if "trading_mode" not in st.session_state:
-    st.session_state.trading_mode = "virtual"
-if "engine_initialized" not in st.session_state:
-    st.session_state.engine_initialized = False
-if "wallet_cache" not in st.session_state:
-    st.session_state.wallet_cache = {}  # Store balances per mode
-if "bybit_client" not in st.session_state:
-    st.session_state.bybit_client = None
-if "engine" not in st.session_state:
-    st.session_state.engine = None
-if "has_real_trades" not in st.session_state:
-    st.session_state.has_real_trades = None  # Cache for db_has_any_trade
+# Initialize logger
+logger = get_trading_logger(__name__)
 
-# --- Initialize trading engine ---
-def initialize_engine():
+# Initialize session state
+if 'initialized' not in st.session_state:
+    st.session_state.initialized = False
+    st.session_state.trading_engine = None
+    st.session_state.automated_trader = None
+    st.session_state.current_exchange = os.getenv("EXCHANGE", "binance").lower()
+    st.session_state.trading_active = False
+    st.session_state.account_type = 'virtual'  # Default to virtual
+
+def to_float(value):
     try:
-        from engine import TradingEngine
-        if not st.session_state.engine_initialized:
-            st.session_state.engine = TradingEngine()
-            st.session_state.engine_initialized = True
-            logger.info("Trading engine initialized successfully")
+        return float(value or 0)
+    except Exception:
+        return 0.0
+
+def initialize_app():
+    """Initialize the application components"""
+    try:
+        # Load settings
+        settings = load_settings()
+        exchange = settings.get("EXCHANGE", "binance").lower()
+        trading_mode = settings.get("TRADING_MODE", "virtual").lower()
+
+        # Check if API keys are available
+        has_api_keys = validate_env(exchange)
+
+        if not bool(has_api_keys):
+            st.warning(f"⚠️ No API credentials found for {exchange.title()}. Running in **Virtual Mode Only**.")
+
+            with st.expander("📝 About Virtual Mode", expanded=False):
+                st.markdown(f"""
+                ### Virtual Trading Mode
+
+                You're currently running in **Virtual Mode** which allows you to:
+                - ✅ Fetch real market data
+                - ✅ Generate trading signals
+                - ✅ Execute virtual trades
+                - ✅ Track performance
+                - ❌ Cannot execute real trades
+
+                ### To Enable Real Trading:
+
+                1. Click on the **Secrets** tool (🔒) in the left sidebar
+                2. Add your exchange API credentials:
+
+                **For Binance:**
+                - `BINANCE_API_KEY` = your Binance API key
+                - `BINANCE_API_SECRET` = your Binance API secret
+
+                **For Bybit:**
+                - `BYBIT_API_KEY` = your Bybit API key
+                - `BYBIT_API_SECRET` = your Bybit API secret
+
+                3. Click **Save** and restart the application
+                """)
+
+            # Force virtual mode
+            st.session_state.account_type = 'virtual'
+        else:
+            st.session_state.account_type = trading_mode
+
+        # Initialize trading engine
+        trading_engine: TradingEngine = TradingEngine()
+        trading_engine.switch_exchange(exchange)
+        if trading_mode == 'real' and bool(has_api_keys):
+            trading_engine.enable_trading()
+
+        # Initialize automated trader
+        automated_trader = AutomatedTrader(trading_engine)
+
+        # Store in session state
+        st.session_state.trading_engine = trading_engine
+        st.session_state.automated_trader = automated_trader
+        st.session_state.current_exchange = exchange
+        st.session_state.initialized = True
+
         return True
+
     except Exception as e:
-        st.error(f"Failed to initialize trading engine: {e}")
-        logger.error(f"Engine initialization failed: {e}", exc_info=True)
+        logger.error(f"Failed to initialize app: {e}")
+        st.error(f"Application initialization failed: {str(e)}")
         return False
 
-# --- Initialize Bybit client ---
-def initialize_bybit():
-    if st.session_state.bybit_client is None or not st.session_state.bybit_client.is_connected():
+@st.cache_data
+def get_cached_dashboard_data(exchange: str, account_type: str, _is_virtual: bool) -> Dict[str, Any]:
+    """Fetch and cache dashboard data as plain dictionaries"""
+    with db_manager.get_session() as session:
         try:
-            st.session_state.bybit_client = BybitClient()
-            if st.session_state.bybit_client._test_connection():
-                logger.info("Bybit client connected successfully")
-                return True
-            else:
-                st.warning("Bybit client connection failed. Check API keys in .env file.")
-                logger.error("Bybit client connection test failed")
-                st.session_state.bybit_client = None
-                return False
+            # Fetch signals
+            signals = db_manager.get_signals(limit=10, exchange=exchange) or []
+            signals_data = [s.to_dict() for s in signals]
+
+            # Fetch wallet balance
+            wallet = db_manager.get_wallet_balance(account_type=account_type, exchange=exchange)
+            wallet_data = wallet.to_dict() if wallet else {'available': 0.0}
+
+            # Fetch trades
+            open_trades = db_manager.get_trades(status='open', virtual=_is_virtual, exchange=exchange) or []
+            closed_trades = db_manager.get_trades(status='closed', virtual=_is_virtual, exchange=exchange) or []
+            open_trades_data = [t.to_dict() for t in open_trades]
+            closed_trades_data = [t.to_dict() for t in closed_trades]
+
+            return {
+                'signals': signals_data,
+                'wallet': wallet_data,
+                'open_trades': open_trades_data,
+                'closed_trades': closed_trades_data
+            }
         except Exception as e:
-            st.error(f"Failed to initialize Bybit client: {e}")
-            logger.error(f"Bybit client initialization failed: {e}", exc_info=True)
-            st.session_state.bybit_client = None
-            return False
-    return True
+            logger.error(f"Error fetching cached dashboard data: {e}")
+            return {
+                'signals': [],
+                'wallet': {'available': 0.0},
+                'open_trades': [],
+                'closed_trades': []
+            }
 
-# --- Helper: does DB already have any REAL trades? ---
-def db_has_any_trade(mode: str = "real") -> bool:
-    """
-    Return True if the DB contains at least one trade for the given mode.
-    Uses cached result if available, otherwise queries DB.
-    """
-    if mode == "real" and st.session_state.has_real_trades is not None:
-        logger.debug(f"Using cached has_real_trades: {st.session_state.has_real_trades}")
-        return st.session_state.has_real_trades
+@st.cache_data
+def get_cached_signals(exchange: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch and cache recent signals as plain dictionaries"""
+    with db_manager.get_session() as session:
+        try:
+            signals = db_manager.get_signals(limit=limit, exchange=exchange) or []
+            return [s.to_dict() for s in signals]
+        except Exception as e:
+            logger.error(f"Error fetching cached signals: {e}")
+            return []
 
-    try:
-        db = st.session_state.engine.db if st.session_state.engine else None
-        if not db:
-            logger.warning("No database access for trade check")
-            return False
-
-        trades = db.get_trades(mode=mode, limit=1)
-        has_trades = bool(trades)
-        if mode == "real":
-            st.session_state.has_real_trades = has_trades
-            logger.info(f"Cached has_real_trades: {has_trades}")
-        return has_trades
-    except Exception as e:
-        logger.error(f"db_has_any_trade check failed for {mode}: {e}", exc_info=True)
-        return False
-
-# --- Fetch wallet balance ---
-def get_wallet_balance() -> dict:
-    """
-    Fetch wallet balance based on the selected trading mode.
-    Returns a dict with capital, available, and used balances.
-    Always safe, fallback to defaults.
-    """
-    mode = st.session_state.trading_mode
-    default_virtual = {"capital": 100.0, "available": 100.0, "used": 0.0}
-    default_real = {"capital": 0.0, "available": 0.0, "used": 0.0}
-
-    # Check cache
-    if mode in st.session_state.wallet_cache:
-        logger.debug(f"Returning cached {mode} balance: {st.session_state.wallet_cache[mode]}")
-        return st.session_state.wallet_cache[mode]
-
-    balance_data = default_virtual if mode == "virtual" else default_real
-    try:
-        if not st.session_state.engine:
-            logger.warning("Engine not initialized for balance fetch")
-            return balance_data
-
-        if mode == "virtual":
-            wallet = st.session_state.engine.db.get_wallet_balance("virtual")
-            if wallet:
-                balance_data = {
-                    "capital": getattr(wallet, "capital", default_virtual["capital"]),
-                    "available": getattr(wallet, "available", default_virtual["available"]),
-                    "used": getattr(wallet, "used", default_virtual["used"])
-                }
-                logger.info(f"Fetched virtual wallet balance: {balance_data}")
-        else:  # real mode
-            if initialize_bybit() and st.session_state.bybit_client.is_connected():
-                # Sync real balance with Bybit
-                if st.session_state.engine.sync_real_balance():
-                    wallet = st.session_state.engine.db.get_wallet_balance("real")
-                    if wallet:
-                        balance_data = {
-                            "capital": getattr(wallet, "capital", default_real["capital"]),
-                            "available": getattr(wallet, "available", default_real["available"]),
-                            "used": getattr(wallet, "used", default_real["used"])
-                        }
-                        logger.info(
-                            f"Fetched real wallet balance after sync: capital=${balance_data['capital']:.2f}, "
-                            f"available=${balance_data['available']:.2f}, used=${balance_data['used']:.2f}"
-                        )
-                    else:
-                        logger.warning("Failed to retrieve real balance after sync")
-                        st.error("❌ Failed to retrieve real balance. Check Bybit account or API permissions.")
-                else:
-                    logger.warning("Real balance sync failed")
-                    st.error("❌ Real balance sync failed. Using last known balance.")
-                    wallet = st.session_state.engine.db.get_wallet_balance("real")
-                    if wallet:
-                        balance_data = {
-                            "capital": getattr(wallet, "capital", default_real["capital"]),
-                            "available": getattr(wallet, "available", default_real["available"]),
-                            "used": getattr(wallet, "used", default_real["used"])
-                        }
-                        logger.info(f"Using DB real balance: {balance_data}")
-            else:
-                logger.warning("Bybit client not connected for real balance")
-                st.warning("Bybit API not connected. Check API keys in .env file.")
-                wallet = st.session_state.engine.db.get_wallet_balance("real")
-                if wallet:
-                    balance_data = {
-                        "capital": getattr(wallet, "capital", default_real["capital"]),
-                        "available": getattr(wallet, "available", default_real["available"]),
-                        "used": getattr(wallet, "used", default_real["used"])
-                    }
-                    logger.info(f"Using DB real balance (API disconnected): {balance_data}")
-
-    except Exception as e:
-        logger.error(f"Error fetching {mode} wallet: {e}", exc_info=True)
-        st.error(f"Error fetching {mode} balance: {e}")
-        balance_data = default_virtual if mode == "virtual" else default_real
-
-    # Cache balance for this session
-    st.session_state.wallet_cache[mode] = balance_data
-    logger.info(f"Cached {mode} balance: {balance_data}")
-
-    # Conditional messaging for real balance
-    if mode == "real" and balance_data["available"] <= 0:
-        st.warning("Real available balance is low or zero. Deposit funds on Bybit.")
-
-    return balance_data
+@st.cache_data
+def get_cached_trades(exchange: str, _is_virtual: bool, limit: int = 5) -> List[Dict[str, Any]]:
+    """Fetch and cache recent trades as plain dictionaries"""
+    with db_manager.get_session() as session:
+        try:
+            trades = db_manager.get_trades(status='closed', virtual=_is_virtual, exchange=exchange, limit=limit) or []
+            return [t.to_dict() for t in trades]
+        except Exception as e:
+            logger.error(f"Error fetching cached trades: {e}")
+            return []
 
 def main():
-    # Initialize engine
-    if not initialize_engine():
+    """Main application entry point"""
+    
+    try:
+        # Application header
+        st.title("🚀 AlgoTraderPro V2.0")
+        st.markdown("*Advanced Multi-Exchange Cryptocurrency Trading Platform*")
+
+        # Initialize app if not done
+        if not bool(st.session_state.initialized):
+            with st.spinner("Initializing AlgoTrader Pro..."):
+                if not initialize_app():
+                    st.stop()
+    except Exception as e:
+        logger.error(f"Critical error in main: {e}")
+        st.error("⚠️ Application Error - Please refresh the page")
         st.stop()
 
-    # Load saved trading mode from DB
-    if "trading_mode" not in st.session_state or st.session_state.trading_mode is None:
-        try:
-            saved_mode = st.session_state.engine.db.get_setting("trading_mode")
-            st.session_state.trading_mode = saved_mode if saved_mode in ["virtual", "real"] else "virtual"
-            logger.info(f"Loaded trading mode from DB: {st.session_state.trading_mode}")
-        except Exception as e:
-            logger.error(f"Failed to load trading mode from DB: {e}", exc_info=True)
-            st.session_state.trading_mode = "virtual"
+    # Load settings for current exchange and mode
+    settings = load_settings()
+    current_exchange = st.session_state.get('current_exchange', settings.get("EXCHANGE", "binance")).lower()
+    account_type = st.session_state.get('account_type', settings.get("TRADING_MODE", "virtual")).lower()
 
-    # --- Sidebar ---
-    with st.sidebar:
-        st.markdown("### 🎛️ Trading Controls")
+    # Exchange Selection at Top
+    st.markdown("### 🏦 Select Exchange")
+    col1, col2 = st.columns(2)
 
-        # --- Mode selector ---
-        mode_options = ["Virtual", "Real"]
-        selected_mode_index = 0 if st.session_state.trading_mode == "virtual" else 1
-        selected_mode = st.selectbox(
-            "Trading Mode",
-            mode_options,
-            index=selected_mode_index,
-            help="Switch between virtual (simulated) and real (live) trading. Real mode requires a connected Bybit account."
-        )
-
-        if selected_mode.lower() != st.session_state.trading_mode:
-            if selected_mode.lower() == "real":
-                st.warning("⚠️ Real mode enables LIVE trading on Bybit. Ensure sufficient funds and valid API keys.")
-            try:
-                st.session_state.trading_mode = selected_mode.lower()
-                st.session_state.engine.db.save_setting("trading_mode", st.session_state.trading_mode)
-                st.session_state.wallet_cache.clear()
-                st.session_state.has_real_trades = None  # Reset trade cache
-                logger.info(f"Switched to {st.session_state.trading_mode} mode, cleared cache")
-                
-                if st.session_state.trading_mode == "real":
-                    if initialize_bybit() and st.session_state.bybit_client.is_connected():
-                        st.session_state.engine.sync_real_balance()
-                        if db_has_any_trade("real"):
-                            st.session_state.engine.sync_real_trades()
-                            logger.info("Real trades synced after mode switch (DB has trades)")
-                            st.success("✅ Switched to real mode. Trades and balance synced.")
-                        else:
-                            logger.info("Skipped real trade sync: no existing real trades in DB")
-                            st.success("✅ Switched to real mode. Ready for live trading.")
+    with col1:
+        binance_type = "primary" if current_exchange == "binance" else "secondary"
+        if st.button("🟡 Binance", type=binance_type, use_container_width=True, key="exchange_binance"):
+            if current_exchange != "binance":
+                st.session_state.current_exchange = "binance"
+                try:
+                    engine = st.session_state.trading_engine
+                    if engine is not None and bool(engine.switch_exchange("binance")):
+                        st.success("✅ Switched to Binance")
+                        settings["EXCHANGE"] = "binance"
+                        save_settings(settings)
+                        st.rerun()
                     else:
-                        st.error("❌ Failed to connect to Bybit API. Reverting to virtual mode.")
-                        st.session_state.trading_mode = "virtual"
-                        st.session_state.engine.db.save_setting("trading_mode", "virtual")
-                        st.session_state.wallet_cache.clear()
-                        st.session_state.has_real_trades = None
-                else:
-                    st.success(f"✅ Switched to {st.session_state.trading_mode} mode.")
-                
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed to switch mode: {e}")
-                logger.error(f"Mode switch to {selected_mode.lower()} failed: {e}", exc_info=True)
-                st.session_state.trading_mode = "virtual"
-                st.session_state.engine.db.save_setting("trading_mode", "virtual")
-                st.rerun()
-
-        # --- Engine & API status ---
-        engine_status = "🟢 Online" if st.session_state.engine_initialized else "🔴 Offline"
-        st.markdown(f"**Engine Status:** {engine_status}")
-        mode_color = "🟢" if st.session_state.trading_mode == "virtual" else "🟡"
-        st.markdown(f"**Trading Mode:** {mode_color} {st.session_state.trading_mode.title()}")
-
-        api_status = "✅ Connected" if st.session_state.bybit_client and st.session_state.bybit_client.is_connected() else "❌ Disconnected"
-        st.markdown(f"**API Status:** {api_status}")
-
-        st.divider()
-
-        # --- Lower Section: Page Navigation ---
-        st.markdown("### 📂 Pages")
-        pages = {
-            "📊 Dashboard": "dashboard",
-            "🎯 Signals": "signals",
-            "📈 Trades": "trades",
-            "📊 Performance": "performance",
-            "⚙️ Settings": "settings"
-        }
-
-        # Use radio buttons for user-friendly navigation
-        if "active_page" not in st.session_state:
-            st.session_state.active_page = "📊 Dashboard"
-
-        selected_page = st.radio("Navigate", list(pages.keys()), index=list(pages.keys()).index(st.session_state.active_page))
-        if selected_page != st.session_state.active_page:
-            st.session_state.active_page = selected_page
-            page_file = pages[selected_page]
-            if page_file != "dashboard":
-                try:
-                    st.switch_page(f"pages/{page_file}.py")
+                        st.error("Failed to switch to Binance")
                 except Exception as e:
-                    st.error(f"Failed to navigate to {page_file}: {e}")
-                    logger.error(f"Navigation to {page_file} failed: {e}", exc_info=True)
+                    st.error(f"Error switching to Binance: {e}")
 
-        # --- Wallet Balance ---
+    with col2:
+        bybit_type = "primary" if current_exchange == "bybit" else "secondary"
+        if st.button("🟠 Bybit", type=bybit_type, use_container_width=True, key="exchange_bybit"):
+            if current_exchange != "bybit":
+                st.session_state.current_exchange = "bybit"
+                try:
+                    engine = st.session_state.trading_engine
+                    if engine is not None and bool(engine.switch_exchange("bybit")):
+                        st.success("✅ Switched to Bybit")
+                        settings["EXCHANGE"] = "bybit"
+                        save_settings(settings)
+                        st.rerun()
+                    else:
+                        st.error("Failed to switch to Bybit")
+                except Exception as e:
+                    st.error(f"Error switching to Bybit: {e}")
+
+    st.divider()
+
+    # Sidebar controls
+    with st.sidebar:
+        st.header("⚙️ Controls")
+
+        # Display selected exchange
+        st.info(f"📍 **Active Exchange:** {current_exchange.title()}")
+
+        # Account Type selection
         st.divider()
-        balance = get_wallet_balance()
-        current_mode = st.session_state.trading_mode
-        capital_val = balance["capital"]
-        available_val = max(balance["available"], 0.0)
-        used_val = max(capital_val - available_val, 0.0)
-        if abs(used_val) < 0.01:
-            used_val = 0.0
+        st.subheader("💼 Trading Mode")
 
-        if current_mode == "virtual":
-            st.metric("💻 Virtual Capital", f"${capital_val:.2f}")
-            st.metric("💻 Virtual Available", f"${available_val:.2f}")
-            st.metric("💻 Virtual Used", f"${used_val:.2f}")
+        col1, col2 = st.columns(2)
+
+        with col1:
+            virtual_type = "primary" if account_type == "virtual" else "secondary"
+            if st.button("🎮 Virtual Trading", type=virtual_type, use_container_width=True, key="mode_virtual"):
+                if account_type != "virtual":
+                    st.session_state.account_type = "virtual"
+                    settings["TRADING_MODE"] = "virtual"
+                    save_settings(settings)
+                    st.success("✅ Switched to Virtual Trading mode")
+                    st.rerun()
+
+        with col2:
+            has_api_keys = validate_env(current_exchange, allow_virtual=False)
+            real_type = "primary" if account_type == "real" else "secondary"
+            has_api_keys_bool = bool(has_api_keys)
+            if st.button("💰 Real Trading", type=real_type, disabled=not has_api_keys_bool, use_container_width=True, key="mode_real"):
+                if account_type != "real":
+                    if has_api_keys_bool:
+                        st.session_state.account_type = "real"
+                        settings["TRADING_MODE"] = "real"
+                        save_settings(settings)
+                        st.success("✅ Switched to Real Trading mode")
+                        st.rerun()
+                    else:
+                        st.error(f"❌ Real trading requires {current_exchange.upper()} API credentials in Secrets")
+
+        # Show current mode info
+        if account_type == "virtual":
+            st.info("ℹ️ Virtual mode uses simulated data and trades")
         else:
-            st.metric("🏦 Real Capital", f"${capital_val:.2f}")
-            st.metric("🏦 Real Available", f"${available_val:.2f}")
-            st.metric("🏦 Real Used Margin", f"${used_val:.2f}")
+            st.warning("⚠️ Real mode uses live market data and executes actual trades")
 
-        # --- Emergency Stop ---
         st.divider()
-        if st.button("🛑 Emergency Stop"):
-            st.session_state.wallet_cache.clear()
-            st.session_state.has_real_trades = None
-            if "automated_trader" in st.session_state:
-                try:
-                    import asyncio
-                    asyncio.run(st.session_state.automated_trader.stop())
-                    logger.info("Automated trader stopped")
-                except Exception as e:
-                    logger.error(f"Failed to stop automated trader: {e}", exc_info=True)
-            st.success("All automated trading stopped and cache cleared")
-            logger.info("Emergency stop triggered, cache cleared")
-            st.rerun()
 
-    # --- Main dashboard ---
+        # Trading controls
+        st.subheader("🎯 Trading Status")
+
+        if st.session_state.trading_engine is not None:
+            trading_enabled = bool(st.session_state.trading_engine.is_trading_enabled())
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                start_disabled = trading_enabled or (account_type == 'virtual')
+                if st.button("▶️ Start Trading", disabled=start_disabled):
+                    try:
+                        if st.session_state.trading_engine is not None and bool(st.session_state.trading_engine.enable_trading()):
+                            st.success("Trading enabled")
+                            st.rerun()
+                    except Exception as e:
+                        logger.error(f"Error enabling trading: {e}")
+                        st.error("Failed to enable trading")
+
+            with col2:
+                if st.button("⏸️ Stop Trading", disabled=not trading_enabled):
+                    try:
+                        if st.session_state.trading_engine is not None and bool(st.session_state.trading_engine.disable_trading("Manual stop")):
+                            st.warning("Trading disabled")
+                            st.rerun()
+                    except Exception as e:
+                        logger.error(f"Error disabling trading: {e}")
+                        st.error("Failed to disable trading")
+
+            # Emergency stop
+            if st.button("🚨 Emergency Stop", type="secondary"):
+                try:
+                    if st.session_state.trading_engine is not None and bool(st.session_state.trading_engine.emergency_stop("Manual emergency stop")):
+                        st.error("Emergency stop activated")
+                        st.rerun()
+                except Exception as e:
+                    logger.error(f"Error during emergency stop: {e}")
+                    st.error("Emergency stop failed")
+
+            # Status indicators
+            if trading_enabled:
+                st.success("🟢 Trading Active")
+            else:
+                st.error("🔴 Trading Inactive")
+
+        st.divider()
+
+        # Quick stats
+        st.subheader("📊 Quick Stats")
+
+        if st.session_state.trading_engine is not None:
+            try:
+                wallet = db_manager.get_wallet_balance(account_type=account_type, exchange=current_exchange)
+                stats = st.session_state.trading_engine.get_trade_statistics(account_type)
+
+                if wallet is not None:
+                    available_val = to_float(wallet.available)
+                    st.metric(f"{account_type.title()} Balance", f"${available_val:.2f}")
+                else:
+                    two_decimals = float(0)
+                    st.metric(f"{account_type.title()} Balance", f"${two_decimals:.2f}")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.metric("Total Trades", int(stats.get('total_trades', 0)))
+                with col2:
+                    st.metric("Win Rate", f"{float(stats.get('win_rate', 0)):.1f}%")
+
+                st.metric("Total P&L", f"${float(stats.get('total_pnl', 0)):.2f}")
+
+            except Exception as e:
+                logger.error(f"Error loading quick stats: {e}")
+                st.error("Error loading stats")
+
+    # Main content area with cards
+    mode_emoji = "🧪" if account_type == 'virtual' else "💰"
+    st.markdown(f"""
+    <div style='padding: 1rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 1rem;'>
+        <h2 style='color: white; margin: 0;'>📈 Dashboard - {current_exchange.title()}</h2>
+        <p style='color: white; margin: 0.5rem 0 0 0;'>{mode_emoji} {account_type.title()} Trading Mode</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Key metrics row with cards
+    st.markdown("### 📊 Key Metrics")
+    col1, col2, col3, col4 = st.columns(4)
+
+    is_virtual = account_type == 'virtual'
+    
     try:
-        from pages.dashboard import main as dashboard_main
-        dashboard_main()
+        # Fetch cached dashboard data
+        dashboard_data = get_cached_dashboard_data(current_exchange, account_type, is_virtual)
+        signals = dashboard_data['signals']
+        wallet = dashboard_data['wallet']
+        open_trades = dashboard_data['open_trades']
+        closed_trades = dashboard_data['closed_trades']
+
+        # Calculate today's P&L
+        today_date = datetime.now(timezone.utc).date().isoformat()
+        today_trades = [t for t in closed_trades if t['created_at'].startswith(today_date)]
+        today_pnl = sum(t['pnl'] for t in today_trades)
+
+        with col1:
+            recent_count = len(signals)
+            last_scan = "Never"
+            if recent_count > 0 and signals[0]['created_at'] != 'N/A':
+                last_scan = signals[0]['created_at'].split(' ')[1][:5]  # Extract HH:MM
+            st.metric("Recent Signals", recent_count, delta=f"Last scan: {last_scan}")
+
+        with col2:
+            open_count = len(open_trades)
+            max_open = getattr(st.session_state.trading_engine, "max_open_positions", "N/A") if st.session_state.trading_engine is not None else "N/A"
+            st.metric("Open Positions", open_count, delta=f"Max: {max_open}")
+
+        with col3:
+            balance_label = f"{account_type.title()} Balance"
+            balance_value = f"${wallet['available']:.2f}"
+            st.metric(balance_label, balance_value)
+
+        with col4:
+            pnl_value = float(to_float(today_pnl))
+            pnl_delta = "➖"
+            if pnl_value > 0:
+                pnl_delta = "📈"
+            elif pnl_value < 0:
+                pnl_delta = "📉"
+            st.metric("Today's P&L", f"${pnl_value:.2f}", delta=pnl_delta)
+
     except Exception as e:
-        st.error(f"Error loading dashboard: {e}")
-        logger.error(f"Dashboard error: {e}", exc_info=True)
+        logger.error(f"Error loading dashboard metrics: {e}")
+        st.error("Error loading dashboard data")
+
+    # Recent activity
+    st.subheader("🔄 Recent Activity")
+
+    tab1, tab2 = st.tabs(["Latest Signals", "Recent Trades"])
+
+    with tab1:
+        try:
+            signals = get_cached_signals(current_exchange, limit=5)
+            if len(signals) > 0:
+                for signal in signals:
+                    with st.container():
+                        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+                        with col1:
+                            st.write(f"**{signal['symbol']}** - {signal['side']}")
+                            st.caption(f"Created: {signal['created_at']}")
+                        with col2:
+                            st.metric("Score", f"{signal['score']:.1f}")
+                        with col3:
+                            st.metric("Entry", f"${signal['entry']:.6f}")
+                        with col4:
+                            side_upper = signal['side'].upper()
+                            color = "green" if side_upper in ["BUY", "LONG"] else "red"
+                            st.markdown(f":{color}[{signal['market']}]")
+                        st.divider()
+            else:
+                st.info("No recent signals found")
+        except Exception as e:
+            logger.error(f"Error loading recent signals: {e}")
+            st.error("Error loading signals")
+
+    with tab2:
+        try:
+            recent_trades = get_cached_trades(current_exchange, is_virtual, limit=5)
+            if len(recent_trades) > 0:
+                for trade in reversed(recent_trades):
+                    with st.container():
+                        col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
+                        with col1:
+                            st.write(f"**{trade['symbol']}** - {trade['side']}")
+                            st.caption(f"Closed: {trade['updated_at']}")
+                        with col2:
+                            st.metric("Qty", f"{trade['qty']:.6f}")
+                        with col3:
+                            st.metric("P&L", f"${trade['pnl']:.2f}")
+                        with col4:
+                            color = "green" if trade['pnl'] > 0 else "red" if trade['pnl'] < 0 else "gray"
+                            label = "Profit" if trade['pnl'] > 0 else "Loss" if trade['pnl'] < 0 else "Break Even"
+                            st.markdown(f":{color}[{label}]")
+                        st.divider()
+            else:
+                st.info("No recent trades found")
+        except Exception as e:
+            logger.error(f"Error loading recent trades: {e}")
+            st.error("Error loading trades")
+
+    # Auto-refresh
+    if st.button("🔄 Refresh Dashboard"):
+        st.cache_data.clear()  # Clear cache on refresh
+        st.rerun()
 
     # Footer
-    st.markdown("---")
+    st.divider()
     st.markdown(
-        f"<div style='text-align:center;color:#888;'>AlgoTrader Pro v1.0 | Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>",
+        f"""
+        <div style='text-align: center; color: #666;'>
+            AlgoTrader Pro v2.0 | Exchange: {current_exchange.title()} | 
+            Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
+        </div>
+        """,
         unsafe_allow_html=True
     )
 

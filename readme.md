@@ -1,80 +1,75 @@
-# AlgoTrader Pro
+AlgoTrader Pro
+AlgoTrader Pro is a cryptocurrency algorithmic trading platform built with Streamlit, supporting automated trading on both Binance and Bybit exchanges. It operates in virtual (paper trading) and real trading modes, offering signal generation with technical indicators, machine learning filtering, portfolio management, ML feedback storage, and comprehensive performance analytics.
+The platform scans multiple cryptocurrency markets, generates trading signals using technical analysis, executes trades automatically, and provides real-time monitoring and reporting through an intuitive web interface.
 
-AlgoTrader Pro is a cryptocurrency algorithmic trading platform built with Streamlit that provides automated trading capabilities across multiple trading pairs on the Bybit exchange. The system operates in both virtual (paper trading) and real trading modes, featuring signal generation using technical indicators, machine learning filtering, portfolio management, and comprehensive performance analytics.
+System Architecture
+Frontend Architecture
 
-The platform is designed as a full-stack trading solution that can scan multiple cryptocurrency markets, generate trading signals based on technical analysis, execute trades automatically, and provide real-time monitoring and reporting capabilities through an intuitive web interface.
+Streamlit serves as the primary web framework with a multi-page architecture.
+Main entry point (app.py) initializes the trading engine, manages session state, and supports dynamic exchange selection (Binance or Bybit).
+Individual pages in the pages/ directory include Dashboard, Signals, Trades, Performance Analytics, Settings, and ML Feedback.
 
----
+Backend Architecture
 
-# System Architecture
+TradingEngine (engine.py for Bybit, binance_trading_engine.py for Binance) orchestrates trading operations, dynamically loaded based on the EXCHANGE environment variable.
+Exchange Clients (binance_client.py, bybit_client.py) handle API communication (REST + WebSocket) for their respective exchanges.
+AutomatedTrader (automated_trader.py) manages trading loops and execution.
+SignalGenerator (signal_generator.py) creates technical analysis signals.
+MLFilter (ml.py) applies machine learning to filter and score trading signals.
+Indicators (indicators.py) fetches market data and calculates technical indicators for both exchanges.
 
-## Frontend Architecture
-- **Streamlit** is used as the primary web framework with a multi-page architecture.
-- Main entry point (`app.py`) initializes the trading engine and manages session state.
-- Individual pages live in the `pages/` directory (Dashboard, Signals, Trades, Performance Analytics, Settings).
+Data Storage
 
-## Backend Architecture
-- **TradingEngine** (`engine.py`) → orchestrates trading operations.
-- **BybitClient** (`bybit_client.py`) → handles API communication (REST + WebSocket).
-- **AutomatedTrader** (`automated_trader.py`) → manages trading loops and execution.
-- **SignalGenerator** (`signal_generator.py`) → creates technical analysis signals.
+PostgreSQL with SQLAlchemy ORM stores trades, signals, wallet balances, settings, and ML feedback.
+Models: SignalModel, TradeModel, WalletBalanceModel, SettingsModel, FeedbackModel.
 
-## Data Storage
-- **PostgreSQL** via SQLAlchemy ORM for trades, signals, and settings.
-- **Alembic** for database migrations.
-- JSON config files: `settings.json`, `capital.json`, `virtual_trades.json`.
 
-## Signal Generation
-- Indicators: SMA, EMA, RSI, MACD, Bollinger Bands, ATR, Volume.
-- ML filtering with XGBoost (`ml.py`) for signal scoring.
+Alembic manages database migrations.
+JSON config files: settings.json, capital.json, virtual_trades.json.
 
-## Risk Management
-- Position sizing based on account balance.
-- Stop-loss and take-profit automation.
-- Drawdown limits, leverage controls.
-- Virtual trading mode for safe testing.
+Signal Generation
 
----
+Indicators: SMA, EMA, RSI, MACD, Bollinger Bands, ATR, Volume.
+ML filtering with XGBoost (ml.py) using features: rsi, macd, macd_signal, macd_histogram, bb_position, volume_ratio, trend_score, volatility, price_change_1h, price_change_4h, price_change_24h.
+Feedback storage in FeedbackModel for ML model retraining.
 
-# External Dependencies
+Risk Management
 
-- **Bybit API** – market data + trade execution
-- **pandas**, **numpy** – data wrangling
-- **plotly** – interactive charts
-- **scikit-learn**, **xgboost** – ML filtering
-- **sqlalchemy**, **alembic** – database + migrations
-- **psycopg2-binary** – PostgreSQL driver
-- **requests**, **tenacity** – API handling
-- **streamlit** – web UI
-- **discord.py**, **telegram-bot**, WhatsApp integration – notifications
+Position sizing based on account balance.
+Stop-loss and take-profit automation.
+Drawdown limits, leverage controls.
+Virtual trading mode for safe testing.
 
----
 
-# 🚀 Setup Guide
+External Dependencies
 
-## 1. Clone Repository
-```bash
+Binance/Bybit APIs – market data and trade execution.
+pandas, numpy – data wrangling.
+plotly – interactive charts.
+scikit-learn, xgboost – ML filtering.
+sqlalchemy, alembic, psycopg2-binary – database and migrations.
+requests, tenacity – API handling.
+streamlit – web UI.
+discord.py, telegram-bot, WhatsApp integration – notifications.
+
+
+🚀 Setup Guide
+1. Clone Repository
 git clone https://github.com/yourusername/algotrader-pro.git
 cd algotrader-pro
-````
 
-## 2. Environment Variables
-
-Create a `.env` file:
-
-```env
-BYBIT_API_KEY=your_api_key
-BYBIT_API_SECRET=your_api_secret
+2. Environment Variables
+Create a .env file:
+EXCHANGE=binance  # or 'bybit'
+BINANCE_API_KEY=your_binance_api_key
+BINANCE_API_SECRET=your_binance_api_secret
+BYBIT_API_KEY=your_bybit_api_key
+BYBIT_API_SECRET=your_bybit_api_secret
 DB_URL=postgresql+psycopg2://trader:securepass@db:5432/algotrader
-```
 
----
 
-# 🐳 Dockerized Setup (Streamlit + PostgreSQL + pgAdmin4)
-
-## docker-compose.yml
-
-```yaml
+🐳 Dockerized Setup (Streamlit + PostgreSQL + pgAdmin4)
+docker-compose.yml
 version: "3.9"
 
 services:
@@ -108,9 +103,12 @@ services:
     container_name: algotrader-app
     restart: always
     environment:
+      EXCHANGE: ${EXCHANGE:-binance}
+      BINANCE_API_KEY: ${BINANCE_API_KEY}
+      BINANCE_API_SECRET: ${BINANCE_API_SECRET}
+      BYBIT_API_KEY: ${BYBIT_API_KEY}
+      BYBIT_API_SECRET: ${BYBIT_API_SECRET}
       DB_URL: postgresql+psycopg2://trader:securepass@db:5432/algotrader
-      BYBIT_API_KEY: your_api_key
-      BYBIT_API_SECRET: your_api_secret
     volumes:
       - .:/app
     ports:
@@ -121,11 +119,8 @@ services:
 
 volumes:
   db_data:
-```
 
-## Dockerfile
-
-```dockerfile
+Dockerfile
 FROM python:3.10-slim
 
 WORKDIR /app
@@ -138,11 +133,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
-```
 
-## requirements.txt
-
-```
+requirements.txt
 streamlit
 sqlalchemy
 psycopg2-binary
@@ -155,68 +147,63 @@ requests
 python-dotenv
 alembic
 tenacity
-```
 
----
 
-# 🛠 Database Migrations with Alembic
-
-## Initialize Alembic
-
-```bash
+🛠 Database Migrations with Alembic
+Initialize Alembic
 alembic init migrations
-```
 
-This creates a `migrations/` folder and `alembic.ini`.
-
-## Update `alembic.ini`
-
+This creates a migrations/ folder and alembic.ini.
+Update alembic.ini
 Set SQLAlchemy URL:
-
-```ini
 sqlalchemy.url = postgresql+psycopg2://trader:securepass@db:5432/algotrader
-```
 
-## Generate Migration
+Generate Migration
+alembic revision --autogenerate -m "create initial tables including feedback"
 
-```bash
-alembic revision --autogenerate -m "create initial tables"
-```
-
-## Apply Migration
-
-```bash
+Apply Migration
 alembic upgrade head
-```
 
----
 
-# 🔗 Access
+🔗 Access
 
-* Streamlit App → [http://localhost:8501](http://localhost:8501)
-* pgAdmin4 → [http://localhost:5050](http://localhost:5050)
+Streamlit App → http://localhost:8501
+pgAdmin4 → http://localhost:5050
+Login: admin@algotrader.local / adminpass
+Add Server → Host: db, User: trader, Password: securepass
 
-  * Login: `admin@algotrader.local / adminpass`
-  * Add Server → Host: `db`, User: `trader`, Password: `securepass`
 
----
 
-# ✅ Development Flow
 
-1. Edit code / models in Python.
-2. Run `alembic revision --autogenerate -m "update tables"` when models change.
-3. Run `alembic upgrade head` to apply DB schema changes.
-4. Rebuild containers:
+✅ Development Flow
 
-   ```bash
-   docker-compose up --build
-   ```
+Edit code/models in Python (e.g., db.py, ml.py, indicators.py).
 
----
+Run alembic revision --autogenerate -m "update tables" when models change (e.g., adding FeedbackModel).
 
-# 📊 Features in Progress
+Run alembic upgrade head to apply DB schema changes.
 
-* Strategy backtesting module
-* Multi-exchange support
-* Portfolio rebalancing
-* Advanced ML models
+Rebuild containers:
+docker-compose up --build
+
+
+
+
+📊 Features
+
+Multi-exchange support (Binance, Bybit) via EXCHANGE environment variable.
+Technical indicator-based signal generation (SMA, EMA, RSI, MACD, Bollinger Bands, ATR).
+ML-driven signal filtering with XGBoost, using features like RSI, MACD, Bollinger Band position, and price changes.
+ML feedback storage and management via FeedbackModel in PostgreSQL.
+Real-time portfolio monitoring and performance analytics.
+Virtual and real trading modes.
+Risk management with stop-loss, take-profit, and leverage controls.
+Web-based UI with Streamlit for dashboard, signals, trades, performance, settings, and feedback.
+Notifications via Discord, Telegram, and WhatsApp.
+
+Features in Progress
+
+Strategy backtesting module.
+Portfolio rebalancing.
+Advanced ML models (e.g., deep learning).
+Additional exchange integrations.
