@@ -4,8 +4,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 from datetime import datetime, timezone, timedelta
-from db import DatabaseManager
+from db import db_manager, User, WalletBalance
 from logging_config import get_trading_logger
+import bcrypt
 
 # Page configuration
 st.set_page_config(
@@ -14,30 +15,137 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize components
-if 'trading_engine' not in st.session_state or 'current_exchange' not in st.session_state:
-    st.error("Trading engine or exchange not initialized. Please restart the application.")
-    st.stop()
-
-trading_engine = st.session_state.trading_engine
-db_manager = DatabaseManager()
-current_exchange = st.session_state.current_exchange
-account_type = st.session_state.get('account_type', 'virtual')
-
 # Initialize logger
 logger = get_trading_logger(__name__)
 
+# Initialize session state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
+# Authentication functions
+def authenticate_user(username: str, password: str) -> bool:
+    """Authenticate user against the database with hashed password."""
+    try:
+        with db_manager.get_session() as session:
+            user = session.query(User).filter_by(username=username).first()
+            if user and bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
+                st.session_state.user = {'id': user.id, 'username': user.username}
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"Authentication error for {username}: {e}")
+        return False
+
+def register_user(username: str, password: str) -> bool:
+    """Register a new user with hashed password and initialize wallet balances."""
+    try:
+        with db_manager.get_session() as session:
+            if session.query(User).filter_by(username=username).first():
+                logger.warning(f"Registration failed: Username {username} already exists")
+                return False
+            
+            hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            
+            new_user = User(
+                username=username,
+                password_hash=hashed_password,
+                binance_api_key=None,
+                binance_api_secret=None,
+                bybit_api_key=None,
+                bybit_api_secret=None
+            )
+            session.add(new_user)
+            session.commit()
+
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="virtual",
+                available=100.0,
+                used=0.0,
+                total=100.0,
+                currency="USDT",
+                exchange=st.session_state.get('current_exchange', 'binance')
+            ))
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="real",
+                available=0.0,
+                used=0.0,
+                total=0.0,
+                currency="USDT",
+                exchange=st.session_state.get('current_exchange', 'binance')
+            ))
+            session.commit()
+            logger.info(f"Registered new user: {username}, ID: {new_user.id}")
+            return True
+    except Exception as e:
+        logger.error(f"Registration error for {username}: {e}")
+        session.rollback()
+        return False
+
+# Login/Register UI
+if not st.session_state.get('authenticated', False):
+    st.markdown("### 🔐 Login or Register")
+    login_tab, register_tab = st.tabs(["Login", "Register"])
+
+    with login_tab:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit_login = st.form_submit_button("Login")
+            if submit_login:
+                if authenticate_user(username, password):
+                    st.session_state.authenticated = True
+                    st.success(f"Welcome, {username}!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+
+    with register_tab:
+        with st.form("register_form"):
+            new_username = st.text_input("New Username")
+            new_password = st.text_input("New Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            submit_register = st.form_submit_button("Register")
+            if submit_register:
+                if new_password == confirm_password:
+                    if register_user(new_username, new_password):
+                        st.success("Registration successful! Please login.")
+                    else:
+                        st.error("Registration failed. Username may already exist.")
+                else:
+                    st.error("Passwords do not match")
+
+    st.stop()
+
+# Initialize components
+if 'trading_engine' not in st.session_state or st.session_state.trading_engine is None:
+    st.error("Trading engine not initialized. Please return to the main page to initialize the application.")
+    st.stop()
+
+trading_engine = st.session_state.trading_engine
+current_exchange = st.session_state.get('current_exchange', 'binance')
+account_type = st.session_state.get('account_type', 'virtual')
+user_id = st.session_state.user.get('id') if st.session_state.user else None
+
+if not user_id:
+    st.error("User not authenticated. Please log in from the main page.")
+    st.stop()
+
 st.title("📊 Performance Analytics")
+st.markdown(f"**Exchange:** {current_exchange.title()} | **Mode:** {account_type.title()}")
 
 # Performance overview
 st.subheader("🎯 Portfolio Performance")
 
 try:
-    stats = trading_engine.get_trade_statistics(account_type)
+    stats = trading_engine.get_trade_statistics(account_type) or {}
     
-    wallet = db_manager.get_wallet_balance(account_type)
-    current_balance = wallet.available if wallet else 100.0
-    initial_balance = 100.0  # Default starting balance
+    wallet = db_manager.get_wallet_balance(account_type, user_id=user_id, exchange=current_exchange)
+    current_balance = wallet.get('available', 100.0 if account_type == 'virtual' else 0.0)
+    initial_balance = wallet.get('total', 100.0) if account_type == 'virtual' else 0.0
     
     col1, col2, col3, col4 = st.columns(4)
     
@@ -68,7 +176,13 @@ with tab1:
     st.subheader("💹 Profit & Loss Analysis")
     
     try:
-        closed_trades = db_manager.get_trades(status='closed', virtual=(account_type == 'virtual'), exchange=current_exchange)
+        closed_trades = db_manager.get_trades(
+            status='closed',
+            virtual=(account_type == 'virtual'),
+            exchange=current_exchange,
+            user_id=user_id,
+            limit=2000
+        )
         
         if closed_trades:
             trade_data = [trade.to_dict() for trade in closed_trades]
@@ -77,9 +191,11 @@ with tab1:
             daily_pnl = []
             
             running_pnl = 0
-            for trade in sorted(trade_data, key=lambda x: x['updated_at'] or x['created_at']):
-                if trade['pnl'] is not None:
-                    trade_date = trade['updated_at'] or trade['created_at']
+            for trade in sorted(trade_data, key=lambda x: x.get('updated_at') or x.get('created_at')):
+                if trade.get('pnl') is not None:
+                    trade_date = trade.get('updated_at') or trade.get('created_at')
+                    if isinstance(trade_date, str):
+                        trade_date = datetime.fromisoformat(trade_date)
                     trade_dates.append(trade_date)
                     running_pnl += trade['pnl']
                     cumulative_pnl.append(running_pnl)
@@ -180,7 +296,13 @@ with tab2:
     st.subheader("⚠️ Risk Metrics")
     
     try:
-        closed_trades = db_manager.get_trades(status='closed', virtual=(account_type == 'virtual'), exchange=current_exchange)
+        closed_trades = db_manager.get_trades(
+            status='closed',
+            virtual=(account_type == 'virtual'),
+            exchange=current_exchange,
+            user_id=user_id,
+            limit=2000
+        )
         
         if closed_trades:
             trade_data = [trade.to_dict() for trade in closed_trades]
@@ -227,9 +349,9 @@ with tab2:
                     st.metric("Recovery Factor", f"{recovery_factor:.2f}")
                 
                 st.subheader("📉 Drawdown Analysis")
-                drawdown_dates = [trade['updated_at'] or trade['created_at'] 
-                                for trade in sorted(trade_data, key=lambda x: x['updated_at'] or x['created_at'])
-                                if trade['pnl'] is not None]
+                drawdown_dates = [trade.get('updated_at') or trade.get('created_at') 
+                                 for trade in sorted(trade_data, key=lambda x: x.get('updated_at') or x.get('created_at'))
+                                 if trade.get('pnl') is not None]
                 
                 fig_dd = go.Figure()
                 fig_dd.add_trace(go.Scatter(
@@ -253,7 +375,11 @@ with tab2:
                 st.subheader("⏱️ Risk by Trade Duration")
                 duration_risk = []
                 for trade in trade_data:
-                    if trade['pnl'] is not None and trade['created_at'] and trade['updated_at']:
+                    if trade.get('pnl') is not None and trade.get('created_at') and trade.get('updated_at'):
+                        if isinstance(trade['created_at'], str):
+                            trade['created_at'] = datetime.fromisoformat(trade['created_at'])
+                        if isinstance(trade['updated_at'], str):
+                            trade['updated_at'] = datetime.fromisoformat(trade['updated_at'])
                         duration_hours = (trade['updated_at'] - trade['created_at']).total_seconds() / 3600
                         duration_risk.append({
                             'Duration (Hours)': duration_hours,
@@ -284,7 +410,13 @@ with tab3:
     st.subheader("🔍 Trade Analysis")
     
     try:
-        closed_trades = db_manager.get_trades(status='closed', virtual=(account_type == 'virtual'), exchange=current_exchange)
+        closed_trades = db_manager.get_trades(
+            status='closed',
+            virtual=(account_type == 'virtual'),
+            exchange=current_exchange,
+            user_id=user_id,
+            limit=2000
+        )
         
         if closed_trades:
             trade_data = [trade.to_dict() for trade in closed_trades]
@@ -293,7 +425,7 @@ with tab3:
             sides = []
             
             for trade in trade_data:
-                if trade['pnl'] is not None and trade['entry_price'] and trade['qty']:
+                if trade.get('pnl') is not None and trade.get('entry_price') and trade.get('qty'):
                     trade_value = trade['entry_price'] * trade['qty']
                     return_pct = (trade['pnl'] / trade_value) * 100 if trade_value > 0 else 0
                     trade_sizes.append(trade_value)
@@ -350,11 +482,13 @@ with tab3:
                 day_performance = {}
                 
                 for trade in trade_data:
-                    if trade['pnl'] is not None and trade['created_at']:
+                    if trade.get('pnl') is not None and trade.get('created_at'):
+                        if isinstance(trade['created_at'], str):
+                            trade['created_at'] = datetime.fromisoformat(trade['created_at'])
                         trade_time = trade['created_at']
                         hour = trade_time.hour
                         day = trade_time.strftime('%A')
-                        return_pct = (trade['pnl'] / (trade['entry_price'] * trade['qty']) * 100) if trade['entry_price'] and trade['qty'] else 0
+                        return_pct = (trade['pnl'] / (trade['entry_price'] * trade['qty']) * 100) if trade.get('entry_price') and trade.get('qty') else 0
                         hour_performance.setdefault(hour, []).append(return_pct)
                         day_performance.setdefault(day, []).append(return_pct)
                 
@@ -400,13 +534,19 @@ with tab4:
     st.subheader("🏷️ Symbol Performance")
     
     try:
-        closed_trades = db_manager.get_trades(status='closed', virtual=(account_type == 'virtual'), exchange=current_exchange)
+        closed_trades = db_manager.get_trades(
+            status='closed',
+            virtual=(account_type == 'virtual'),
+            exchange=current_exchange,
+            user_id=user_id,
+            limit=2000
+        )
         
         if closed_trades:
             trade_data = [trade.to_dict() for trade in closed_trades]
             symbol_stats = {}
             for trade in trade_data:
-                if trade['pnl'] is not None:
+                if trade.get('pnl') is not None:
                     symbol = trade['symbol']
                     symbol_stats.setdefault(symbol, {
                         'trades': 0,
@@ -449,7 +589,7 @@ with tab4:
                     except:
                         return ''
                 
-                styled_df = df_symbols.style.map(color_pnl, subset=['Total P&L'])
+                styled_df = df_symbols.style.applymap(color_pnl, subset=['Total P&L'])
                 st.dataframe(styled_df, use_container_width=True)
                 
                 st.write("**Top/Bottom Performers:**")
@@ -533,11 +673,15 @@ with tab5:
                 st.dataframe(importance_df, use_container_width=True)
             
             st.write("**ML Feedback Analysis:**")
-            feedback_data = db_manager.get_feedback(limit=100, exchange=current_exchange)
+            feedback_data = db_manager.get_feedback(
+                limit=100,
+                exchange=current_exchange,
+                user_id=user_id
+            )
             
             if feedback_data:
                 feedback_list = [f.to_dict() for f in feedback_data]
-                positive_feedback = len([f for f in feedback_list if f['outcome']])
+                positive_feedback = len([f for f in feedback_list if f.get('outcome')])
                 total_feedback = len(feedback_list)
                 ml_accuracy = (positive_feedback / total_feedback) * 100 if total_feedback > 0 else 0
                 
@@ -550,12 +694,13 @@ with tab5:
                     st.metric("ML Accuracy", f"{ml_accuracy:.1f}%")
                 with col4:
                     recent_feedback = len([f for f in feedback_list 
-                                         if f['timestamp'] > datetime.now(timezone.utc) - timedelta(days=7)])
+                                         if isinstance(f.get('timestamp'), datetime) and 
+                                         f['timestamp'] > datetime.now(timezone.utc) - timedelta(days=7)])
                     st.metric("Recent Feedback", recent_feedback)
                 
                 if len(feedback_list) > 5:
-                    feedback_dates = [f['timestamp'] for f in feedback_list]
-                    feedback_outcomes = [1 if f['outcome'] else 0 for f in feedback_list]
+                    feedback_dates = [f['timestamp'] for f in feedback_list if isinstance(f.get('timestamp'), datetime)]
+                    feedback_outcomes = [1 if f.get('outcome') else 0 for f in feedback_list]
                     
                     window_size = min(10, len(feedback_list) // 2)
                     rolling_accuracy = []
@@ -564,7 +709,7 @@ with tab5:
                         accuracy = sum(window_outcomes) / len(window_outcomes) * 100
                         rolling_accuracy.append(accuracy)
                     
-                    if rolling_accuracy:
+                    if rolling_accuracy and feedback_dates:
                         fig_ml_trend = go.Figure()
                         fig_ml_trend.add_trace(go.Scatter(
                             x=feedback_dates[window_size - 1:],
@@ -584,7 +729,11 @@ with tab5:
                         st.plotly_chart(fig_ml_trend, use_container_width=True)
                 
                 st.write("**ML vs. Traditional Signal Performance:**")
-                recent_signals = db_manager.get_signals(limit=100, exchange=current_exchange)
+                recent_signals = db_manager.get_signals(
+                    limit=100,
+                    exchange=current_exchange,
+                    user_id=user_id
+                )
                 ml_enhanced_signals = []
                 traditional_signals = []
                 
@@ -650,6 +799,7 @@ with col1:
                 'generated_at': datetime.now(timezone.utc).isoformat(),
                 'exchange': current_exchange,
                 'account_type': account_type,
+                'user_id': user_id,
                 'statistics': stats
             }
             st.download_button(
@@ -665,7 +815,13 @@ with col1:
 with col2:
     if st.button("📈 Export Trade Data"):
         try:
-            closed_trades = db_manager.get_trades(status='closed', virtual=(account_type == 'virtual'), exchange=current_exchange)
+            closed_trades = db_manager.get_trades(
+                status='closed',
+                virtual=(account_type == 'virtual'),
+                exchange=current_exchange,
+                user_id=user_id,
+                limit=2000
+            )
             if closed_trades:
                 trade_data = [{
                     'ID': trade.id,
@@ -675,10 +831,8 @@ with col2:
                     'Entry Price': trade.entry_price,
                     'Exit Price': trade.exit_price,
                     'P&L': trade.pnl,
-                    'Created': trade.created_at.isoformat(),
-                    'Updated': (trade.updated_at.isoformat() 
-                        if isinstance(trade.updated_at, datetime) 
-                        else None)
+                    'Created': trade.created_at.isoformat() if isinstance(trade.created_at, datetime) else trade.created_at,
+                    'Updated': trade.updated_at.isoformat() if isinstance(trade.updated_at, datetime) else trade.updated_at
                 } for trade in closed_trades]
                 
                 df_trades = pd.DataFrame(trade_data)
@@ -698,7 +852,11 @@ with col2:
 with col3:
     if st.button("🤖 Export ML Data"):
         try:
-            feedback_data = db_manager.get_feedback(limit=1000, exchange=current_exchange)
+            feedback_data = db_manager.get_feedback(
+                limit=1000,
+                exchange=current_exchange,
+                user_id=user_id
+            )
             if feedback_data:
                 ml_data = [{
                     'ID': f.id,
@@ -706,7 +864,7 @@ with col3:
                     'Outcome': f.outcome,
                     'Profit/Loss': f.profit_loss,
                     'Exchange': f.exchange,
-                    'Timestamp': f.timestamp.isoformat()
+                    'Timestamp': f.timestamp.isoformat() if isinstance(f.timestamp, datetime) else f.timestamp
                 } for f in feedback_data]
                 
                 df_ml = pd.DataFrame(ml_data)

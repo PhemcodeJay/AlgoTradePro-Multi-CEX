@@ -6,9 +6,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import json
 from datetime import datetime, timezone, timedelta
-from db import DatabaseManager, FeedbackModel
+from db import db_manager, FeedbackModel, User, WalletBalance
 from ml import MLFilter
 from logging_config import get_trading_logger
+import bcrypt
 
 # Page configuration
 st.set_page_config(
@@ -17,19 +18,127 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize components
-if 'trading_engine' not in st.session_state or 'current_exchange' not in st.session_state:
-    st.error("Trading engine not initialized. Please restart the application.")
-    st.stop()
-
-trading_engine = st.session_state.trading_engine
-db_manager = DatabaseManager()
-current_exchange = st.session_state.current_exchange
-
 # Initialize logger
 logger = get_trading_logger(__name__)
 
+# Initialize session state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
+# Authentication functions
+def authenticate_user(username: str, password: str) -> bool:
+    """Authenticate user against the database with hashed password."""
+    try:
+        with db_manager.get_session() as session:
+            user = session.query(User).filter_by(username=username).first()
+            if user and bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
+                st.session_state.user = {'id': user.id, 'username': user.username}
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"Authentication error for {username}: {e}")
+        return False
+
+def register_user(username: str, password: str) -> bool:
+    """Register a new user with hashed password and initialize wallet balances."""
+    try:
+        with db_manager.get_session() as session:
+            if session.query(User).filter_by(username=username).first():
+                logger.warning(f"Registration failed: Username {username} already exists")
+                return False
+            
+            hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            
+            new_user = User(
+                username=username,
+                password_hash=hashed_password,
+                binance_api_key=None,
+                binance_api_secret=None,
+                bybit_api_key=None,
+                bybit_api_secret=None
+            )
+            session.add(new_user)
+            session.commit()
+
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="virtual",
+                available=100.0,
+                used=0.0,
+                total=100.0,
+                currency="USDT",
+                exchange=st.session_state.get('current_exchange', 'binance')
+            ))
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="real",
+                available=0.0,
+                used=0.0,
+                total=0.0,
+                currency="USDT",
+                exchange=st.session_state.get('current_exchange', 'binance')
+            ))
+            session.commit()
+            logger.info(f"Registered new user: {username}, ID: {new_user.id}")
+            return True
+    except Exception as e:
+        logger.error(f"Registration error for {username}: {e}")
+        session.rollback()
+        return False
+
+# Login/Register UI
+if not st.session_state.get('authenticated', False):
+    st.markdown("### 🔐 Login or Register")
+    login_tab, register_tab = st.tabs(["Login", "Register"])
+
+    with login_tab:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit_login = st.form_submit_button("Login")
+            if submit_login:
+                if authenticate_user(username, password):
+                    st.session_state.authenticated = True
+                    st.success(f"Welcome, {username}!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+
+    with register_tab:
+        with st.form("register_form"):
+            new_username = st.text_input("New Username")
+            new_password = st.text_input("New Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            submit_register = st.form_submit_button("Register")
+            if submit_register:
+                if new_password == confirm_password:
+                    if register_user(new_username, new_password):
+                        st.success("Registration successful! Please login.")
+                    else:
+                        st.error("Registration failed. Username may already exist.")
+                else:
+                    st.error("Passwords do not match")
+
+    st.stop()
+
+# Initialize components
+if 'trading_engine' not in st.session_state or st.session_state.trading_engine is None:
+    st.error("Trading engine not initialized. Please return to the main page to initialize the application.")
+    st.stop()
+
+trading_engine = st.session_state.trading_engine
+current_exchange = st.session_state.get('current_exchange', 'binance')
+account_type = st.session_state.get('account_type', 'virtual')
+user_id = st.session_state.user.get('id') if st.session_state.user else None
+
+if not user_id:
+    st.error("User not authenticated. Please log in from the main page.")
+    st.stop()
+
 st.title("🤖 Machine Learning Feedback & Training")
+st.markdown(f"**Exchange:** {current_exchange.title()} | **Mode:** {account_type.title()} | **User:** {st.session_state.user.get('username', 'N/A')}")
 
 # ML Status Overview
 st.subheader("📊 ML Model Status")
@@ -44,16 +153,15 @@ try:
         st.metric("Model Status", model_status)
     
     with col2:
-        feedback_count = len(db_manager.get_feedback(limit=1000, exchange=current_exchange))
+        feedback_count = len(db_manager.get_feedback(limit=1000, exchange=current_exchange, user_id=user_id))
         st.metric("Total Feedback", feedback_count)
     
     with col3:
-        recent_feedback = len(db_manager.get_feedback(limit=100, exchange=current_exchange))
+        recent_feedback = len(db_manager.get_feedback(limit=100, exchange=current_exchange, user_id=user_id))
         st.metric(f"{current_exchange.title()} Feedback", recent_feedback)
     
     with col4:
-        # Calculate accuracy from recent feedback
-        recent_data = db_manager.get_feedback(limit=100, exchange=current_exchange)
+        recent_data = db_manager.get_feedback(limit=100, exchange=current_exchange, user_id=user_id)
         if recent_data:
             recent_data_list = [f.to_dict() for f in recent_data]
             positive_outcomes = len([f for f in recent_data_list if f['outcome']])
@@ -68,7 +176,7 @@ except Exception as e:
 
 st.divider()
 
-# Helper functions (moved here to ensure they are defined before usage)
+# Helper functions
 def get_feature_description(feature: str) -> str:
     """Get description for ML features"""
     descriptions = {
@@ -89,14 +197,13 @@ def get_feature_description(feature: str) -> str:
 def get_feature_performance(feature: str) -> str:
     """Get performance metrics for a specific feature"""
     try:
-        trades = db_manager.get_trades(limit=100, exchange=current_exchange)
+        trades = db_manager.get_trades(limit=100, exchange=current_exchange, user_id=user_id, virtual=(account_type == 'virtual'))
         trades_list = [t.to_dict() for t in trades]
-        valid_trades = [t for t in trades_list if t['indicators'] and t['virtual'] and t['pnl'] is not None]
+        valid_trades = [t for t in trades_list if t['indicators'] and t['pnl'] is not None]
         
         if not valid_trades:
             return "No data available"
         
-        # Extract feature values and outcomes
         feature_values = []
         outcomes = []
         for trade in valid_trades:
@@ -107,11 +214,9 @@ def get_feature_performance(feature: str) -> str:
         if not feature_values:
             return "Feature not found in trade data"
         
-        # Calculate correlation with outcome
         df = pd.DataFrame({'feature': feature_values, 'outcome': outcomes})
         correlation = df['feature'].corr(df['outcome'])
         
-        # Calculate feature statistics for profitable vs unprofitable trades
         profitable = df[df['outcome'] == 1]['feature']
         unprofitable = df[df['outcome'] == 0]['feature']
         
@@ -151,10 +256,9 @@ with tab1:
         st.write("**Training Data Overview:**")
         
         try:
-            # Get training data statistics
-            all_trades = db_manager.get_trades(limit=1000, exchange=current_exchange)
+            all_trades = db_manager.get_trades(limit=1000, exchange=current_exchange, user_id=user_id, virtual=(account_type == 'virtual'))
             all_trades_list = [t.to_dict() for t in all_trades]
-            virtual_trades = [t for t in all_trades_list if t['virtual'] and t['pnl'] is not None]
+            virtual_trades = [t for t in all_trades_list if t['pnl'] is not None]
             
             if virtual_trades:
                 profitable_trades = len([t for t in virtual_trades if t['pnl'] > 0])
@@ -169,10 +273,6 @@ with tab1:
                 for key, value in training_stats.items():
                     st.write(f"**{key}:** {value}")
                 
-                # Training data quality assessment
-                st.write("**Data Quality Assessment:**")
-                
-                # Check for indicators in trades
                 trades_with_indicators = [t for t in virtual_trades if t['indicators']]
                 indicator_coverage = (len(trades_with_indicators) / len(virtual_trades)) * 100
                 
@@ -183,9 +283,10 @@ with tab1:
                 elif indicator_coverage >= 95:
                     st.success("✅ Excellent indicator coverage for training")
                 
-                # Recent data distribution
                 recent_trades = [t for t in virtual_trades 
-                               if t['created_at'] > datetime.now(timezone.utc) - timedelta(days=30)]
+                               if isinstance(t['created_at'], (datetime, str)) and 
+                               (datetime.fromisoformat(t['created_at']) if isinstance(t['created_at'], str) else t['created_at']) > 
+                               datetime.now(timezone.utc) - timedelta(days=30)]
                 
                 if recent_trades:
                     st.write(f"**Recent Training Data (30 days):** {len(recent_trades)} trades")
@@ -202,12 +303,10 @@ with tab1:
     with col2:
         st.write("**Model Actions:**")
         
-        # Train model button
         if st.button("🚀 Train ML Model", type="primary"):
             if len(virtual_trades) >= 50:
                 with st.spinner("Training ML model..."):
                     try:
-                        # Prepare training data
                         training_data = []
                         for trade in virtual_trades:
                             if trade['indicators'] and trade['pnl'] is not None:
@@ -216,7 +315,6 @@ with tab1:
                                     'pnl': trade['pnl']
                                 })
                         
-                        # Train the model
                         success = ml_filter.train_model(training_data)
                         
                         if success:
@@ -230,19 +328,17 @@ with tab1:
             else:
                 st.error(f"Need at least 50 trades for training. Current: {len(virtual_trades)}")
         
-        # Model info
         if ml_filter.model is not None:
             st.write("**Current Model:**")
             st.write(f"Type: Random Forest")
             st.write(f"Features: {len(ml_filter.feature_columns)}")
             st.write(f"Exchange: {current_exchange}")
         
-        # Reset model
         if st.button("🗑️ Reset Model", type="secondary"):
             if st.button("⚠️ Confirm Reset", key="confirm_model_reset"):
                 try:
-                    model_path = f"ml_model_{current_exchange}.joblib"
-                    scaler_path = f"ml_scaler_{current_exchange}.joblib"
+                    model_path = f"ml_model_{current_exchange}_{user_id}.joblib"
+                    scaler_path = f"ml_scaler_{current_exchange}_{user_id}.joblib"
                     
                     if os.path.exists(model_path):
                         os.remove(model_path)
@@ -259,12 +355,10 @@ with tab2:
     st.subheader("📈 Feedback Analysis")
     
     try:
-        # Get feedback data
-        feedback_data = db_manager.get_feedback(limit=500, exchange=current_exchange)
+        feedback_data = db_manager.get_feedback(limit=500, exchange=current_exchange, user_id=user_id)
         
         if feedback_data:
             feedback_list = [f.to_dict() for f in feedback_data]
-            # Feedback overview
             col1, col2, col3 = st.columns(3)
             
             with col1:
@@ -279,19 +373,16 @@ with tab2:
                 accuracy = (positive_count / len(feedback_list)) * 100 if feedback_list else 0
                 st.metric("Overall Accuracy", f"{accuracy:.1f}%")
             
-            # Feedback trends
             st.write("**Feedback Trends:**")
             
-            # Prepare time series data
             feedback_df = pd.DataFrame([{
-                'Date': f['timestamp'].date(),
+                'Date': (datetime.fromisoformat(f['timestamp']) if isinstance(f['timestamp'], str) else f['timestamp']).date(),
                 'Outcome': f['outcome'],
                 'Symbol': f['symbol'],
                 'Exchange': f['exchange'],
                 'Profit_Loss': f['profit_loss'] or 0
             } for f in feedback_list])
             
-            # Daily feedback chart
             daily_feedback = feedback_df.groupby('Date').agg({
                 'Outcome': ['count', 'mean'],
                 'Profit_Loss': 'sum'
@@ -322,7 +413,6 @@ with tab2:
                                          annotation_text="Random Baseline (50%)")
                 st.plotly_chart(fig_success_rate, use_container_width=True)
             
-            # Symbol performance analysis
             st.write("**Performance by Symbol:**")
             
             symbol_stats = feedback_df.groupby('Symbol').agg({
@@ -334,7 +424,6 @@ with tab2:
             symbol_stats = symbol_stats.reset_index()
             symbol_stats = symbol_stats.sort_values('Total_PnL', ascending=False)
             
-            # Display top/bottom performers
             col1, col2 = st.columns(2)
             
             with col1:
@@ -347,25 +436,13 @@ with tab2:
                 bottom_performers = symbol_stats.tail(5)
                 st.dataframe(bottom_performers, use_container_width=True)
             
-            # Exchange comparison
-            if len(feedback_df['Exchange'].unique()) > 1:
-                st.write("**Performance by Exchange:**")
-                
-                exchange_stats = feedback_df.groupby('Exchange').agg({
-                    'Outcome': ['count', 'mean'],
-                    'Profit_Loss': 'sum'
-                }).round(3)
-                
-                exchange_stats.columns = ['Feedback_Count', 'Success_Rate', 'Total_PnL']
-                st.dataframe(exchange_stats, use_container_width=True)
-            
-            # Recent feedback table
             st.write("**Recent Feedback (Last 20):**")
             
             recent_feedback_data = []
             for feedback in feedback_list[:20]:
+                timestamp = datetime.fromisoformat(feedback['timestamp']) if isinstance(feedback['timestamp'], str) else feedback['timestamp']
                 recent_feedback_data.append({
-                    'Date': feedback['timestamp'].strftime('%Y-%m-%d %H:%M'),
+                    'Date': timestamp.strftime('%Y-%m-%d %H:%M'),
                     'Symbol': feedback['symbol'],
                     'Outcome': '✅ Success' if feedback['outcome'] else '❌ Failure',
                     'P&L': f"${feedback['profit_loss']:.2f}" if feedback['profit_loss'] else "N/A",
@@ -374,7 +451,6 @@ with tab2:
             
             df_recent = pd.DataFrame(recent_feedback_data)
             
-            # Color code outcomes
             def color_outcome(val):
                 if '✅' in val:
                     return 'background-color: rgba(0, 255, 0, 0.1)'
@@ -382,7 +458,7 @@ with tab2:
                     return 'background-color: rgba(255, 0, 0, 0.1)'
                 return ''
             
-            styled_df = df_recent.style.map(color_outcome, subset=['Outcome'])
+            styled_df = df_recent.style.applymap(color_outcome, subset=['Outcome'])
             st.dataframe(styled_df, use_container_width=True)
         
         else:
@@ -399,11 +475,9 @@ with tab3:
         ml_filter = MLFilter()
         
         if ml_filter.model is not None:
-            # Get feature importance
             importance = ml_filter.get_feature_importance()
             
             if importance:
-                # Feature importance chart
                 features = list(importance.keys())
                 importances = list(importance.values())
                 
@@ -418,7 +492,6 @@ with tab3:
                 fig_importance.update_layout(height=500)
                 st.plotly_chart(fig_importance, use_container_width=True)
                 
-                # Feature importance table
                 st.write("**Feature Importance Details:**")
                 
                 importance_data = []
@@ -435,32 +508,25 @@ with tab3:
                 df_importance = pd.DataFrame(importance_data)
                 st.dataframe(df_importance, use_container_width=True)
                 
-                # Feature correlation analysis
                 st.write("**Feature Analysis:**")
                 
-                # Get recent trades for feature analysis
-                recent_trades = db_manager.get_trades(limit=100, exchange=current_exchange)
+                recent_trades = db_manager.get_trades(limit=100, exchange=current_exchange, user_id=user_id, virtual=(account_type == 'virtual'))
                 recent_trades_list = [t.to_dict() for t in recent_trades]
-                trades_with_indicators = [t for t in recent_trades_list if t['indicators'] and t['virtual']]
+                trades_with_indicators = [t for t in recent_trades_list if t['indicators']]
                 
                 if len(trades_with_indicators) > 10:
-                    # Extract feature values
                     feature_data = []
                     for trade in trades_with_indicators:
                         indicators = trade['indicators']
                         row = {'outcome': 1 if (trade['pnl'] or 0) > 0 else 0}
                         
                         for feature in ml_filter.feature_columns:
-                            if feature in indicators:
-                                row[feature] = indicators[feature]
-                            else:
-                                row[feature] = 0
+                            row[feature] = indicators.get(feature, 0)
                         
                         feature_data.append(row)
                     
                     df_features = pd.DataFrame(feature_data)
                     
-                    # Feature statistics by outcome
                     profitable_stats = df_features[df_features['outcome'] == 1].describe()
                     unprofitable_stats = df_features[df_features['outcome'] == 0].describe()
                     
@@ -474,7 +540,6 @@ with tab3:
                         st.write("**Unprofitable Trades - Feature Stats:**")
                         st.dataframe(unprofitable_stats.round(4), height=300)
                 
-                # Feature improvement suggestions
                 st.write("**Feature Engineering Suggestions:**")
                 
                 top_features = list(importance.keys())[:3]
@@ -504,16 +569,13 @@ with tab4:
         ml_filter = MLFilter()
         
         if ml_filter.model is not None:
-            # Model validation metrics
             st.write("**Model Validation:**")
             
-            # Get validation data
-            validation_trades = db_manager.get_trades(limit=200, exchange=current_exchange)
+            validation_trades = db_manager.get_trades(limit=200, exchange=current_exchange, user_id=user_id, virtual=(account_type == 'virtual'))
             validation_trades_list = [t.to_dict() for t in validation_trades]
-            virtual_validation = [t for t in validation_trades_list if t['virtual'] and t['indicators'] and t['pnl'] is not None]
+            virtual_validation = [t for t in validation_trades_list if t['indicators'] and t['pnl'] is not None]
             
             if len(virtual_validation) > 20:
-                # Prepare validation data
                 X_val = []
                 y_true = []
                 
@@ -524,14 +586,12 @@ with tab4:
                         y_true.append(1 if trade['pnl'] > 0 else 0)
                 
                 if len(X_val) > 10:
-                    import numpy as np
                     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
                     
                     X_val = np.array(X_val)
                     y_pred = ml_filter.model.predict(ml_filter.scaler.transform(X_val))
                     y_proba = ml_filter.model.predict_proba(ml_filter.scaler.transform(X_val))[:, 1]
                     
-                    # Calculate metrics
                     accuracy = accuracy_score(y_true, y_pred)
                     precision = precision_score(y_true, y_pred)
                     recall = recall_score(y_true, y_pred)
@@ -548,7 +608,6 @@ with tab4:
                     with col4:
                         st.metric("F1-Score", f"{f1:.3f}")
                     
-                    # ROC Curve
                     from sklearn.metrics import roc_curve, auc
                     
                     fpr, tpr, _ = roc_curve(y_true, y_proba)
@@ -575,7 +634,6 @@ with tab4:
                     )
                     st.plotly_chart(fig_roc, use_container_width=True)
                     
-                    # Prediction distribution
                     st.write("**Prediction Distribution:**")
                     
                     col1, col2 = st.columns(2)
@@ -590,7 +648,6 @@ with tab4:
                         st.plotly_chart(fig_pred_dist, use_container_width=True)
                     
                     with col2:
-                        # Confusion matrix
                         from sklearn.metrics import confusion_matrix
                         
                         cm = confusion_matrix(y_true, y_pred)
@@ -605,7 +662,6 @@ with tab4:
                         )
                         st.plotly_chart(fig_cm, use_container_width=True)
                     
-                    # Performance by prediction confidence
                     st.write("**Performance by Confidence:**")
                     
                     confidence_data = []
@@ -619,7 +675,6 @@ with tab4:
                     
                     df_confidence = pd.DataFrame(confidence_data)
                     
-                    # Group by confidence bins
                     df_confidence['Confidence_Bin'] = pd.cut(df_confidence['Confidence'], bins=10)
                     confidence_stats = df_confidence.groupby('Confidence_Bin').agg({
                         'Correct': 'mean',
@@ -656,7 +711,6 @@ with tab5:
     col1, col2 = st.columns(2)
     
     with col1:
-        # Manual feedback form
         feedback_symbol = st.text_input("Symbol", value="BTCUSDT", placeholder="e.g., BTCUSDT")
         
         feedback_outcome = st.selectbox(
@@ -673,7 +727,6 @@ with tab5:
             help="Actual profit or loss amount"
         )
         
-        # Signal data input
         st.write("**Signal Indicators:**")
         
         rsi = st.slider("RSI", 0.0, 100.0, 50.0, 0.1)
@@ -699,7 +752,6 @@ with tab5:
         
         if st.button("💾 Add Feedback", type="primary"):
             try:
-                # Prepare feedback data
                 signal_data = {
                     'symbol': feedback_symbol,
                     'indicators': {
@@ -719,25 +771,21 @@ with tab5:
                 
                 outcome = feedback_outcome.startswith("Success")
                 
-                # Create feedback entry
                 feedback_entry = FeedbackModel(
                     symbol=feedback_symbol,
                     outcome=outcome,
                     profit_loss=profit_loss,
                     signal_data=signal_data,
                     indicators=signal_data['indicators'],
-                    exchange=current_exchange
+                    exchange=current_exchange,
+                    user_id=user_id
                 )
                 
-                # Add to database
                 success = db_manager.add_feedback(feedback_entry)
                 
                 if success:
                     st.success("✅ Feedback added successfully!")
-                    
-                    # Update ML model with new feedback
                     ml_filter.update_model_with_feedback(signal_data, outcome)
-                    
                     st.rerun()
                 else:
                     st.error("❌ Failed to add feedback")
@@ -756,12 +804,10 @@ with col1:
     if st.button("📊 Analyze All Trades"):
         with st.spinner("Analyzing all trades for feedback..."):
             try:
-                # Get all closed virtual trades without feedback
-                all_trades = db_manager.get_trades(limit=1000, exchange=current_exchange)
+                all_trades = db_manager.get_trades(limit=1000, exchange=current_exchange, user_id=user_id, virtual=(account_type == 'virtual'))
                 all_trades_list = [t.to_dict() for t in all_trades]
-                virtual_trades = [t for t in all_trades_list if t['virtual'] and t['pnl'] is not None and t['indicators']]
+                virtual_trades = [t for t in all_trades_list if t['pnl'] is not None and t['indicators']]
                 
-                # Create bulk feedback
                 feedback_count = 0
                 for trade in virtual_trades:
                     try:
@@ -780,7 +826,8 @@ with col1:
                             profit_loss=trade['pnl'],
                             signal_data=signal_data,
                             indicators=trade['indicators'],
-                            exchange=trade['exchange'] or current_exchange
+                            exchange=trade['exchange'] or current_exchange,
+                            user_id=user_id
                         )
                         
                         if db_manager.add_feedback(feedback_entry):
@@ -801,16 +848,23 @@ with col2:
     if st.button("🗑️ Clear Old Feedback"):
         if st.button("⚠️ Confirm Clear", key="confirm_clear_feedback"):
             try:
-                # This would require implementing a method to clear old feedback
-                # For now, show what would be cleared
-                old_feedback = db_manager.get_feedback(limit=1000, exchange=current_exchange)
-                old_feedback_list = [f.to_dict() for f in old_feedback]
+                feedback_data = db_manager.get_feedback(limit=1000, exchange=current_exchange, user_id=user_id)
+                feedback_list = [f.to_dict() for f in feedback_data]
                 older_than_30_days = [
-                    f for f in old_feedback_list 
-                    if f['timestamp'] < datetime.now(timezone.utc) - timedelta(days=30)
+                    f for f in feedback_list 
+                    if (datetime.fromisoformat(f['timestamp']) if isinstance(f['timestamp'], str) else f['timestamp']) < 
+                    datetime.now(timezone.utc) - timedelta(days=30)
                 ]
                 
-                st.info(f"Would clear {len(older_than_30_days)} feedback entries older than 30 days")
+                if older_than_30_days:
+                    with db_manager.get_session() as session:
+                        for feedback in older_than_30_days:
+                            session.query(FeedbackModel).filter_by(id=feedback['id'], user_id=user_id).delete()
+                        session.commit()
+                    st.success(f"✅ Cleared {len(older_than_30_days)} old feedback entries")
+                    st.rerun()
+                else:
+                    st.info("No old feedback entries to clear")
                 
             except Exception as e:
                 logger.error(f"Error clearing feedback: {e}")
@@ -819,7 +873,7 @@ with col2:
 with col3:
     if st.button("📤 Export Feedback"):
         try:
-            feedback_data = db_manager.get_feedback(limit=1000, exchange=current_exchange)
+            feedback_data = db_manager.get_feedback(limit=1000, exchange=current_exchange, user_id=user_id)
             if feedback_data:
                 export_data = [{
                     'ID': f.id,
@@ -827,7 +881,7 @@ with col3:
                     'Outcome': f.outcome,
                     'Profit_Loss': f.profit_loss,
                     'Exchange': f.exchange,
-                    'Timestamp': f.timestamp.isoformat(),
+                    'Timestamp': (datetime.fromisoformat(f.timestamp) if isinstance(f.timestamp, str) else f.timestamp).isoformat(),
                     'Signal_Data': json.dumps(f.signal_data),
                     'Indicators': json.dumps(f.indicators)
                 } for f in feedback_data]
@@ -852,6 +906,8 @@ with col3:
 st.divider()
 st.markdown(f"""
 **ML System Status:** Exchange: {current_exchange.title()} | 
+Mode: {account_type.title()} | 
+User: {st.session_state.user.get('username', 'N/A')} | 
 Model: {'✅ Active' if ml_filter.model is not None else '❌ Inactive'} | 
 Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
 """)

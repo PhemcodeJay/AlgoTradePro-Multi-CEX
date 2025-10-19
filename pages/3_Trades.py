@@ -1,12 +1,14 @@
-# pages/3_Trades.py — fully refactored, interactive (hybrid Binance-style theme)
+# pages/3_Trades.py
 import streamlit as st
 import pandas as pd
 import plotly.express as px
 import time
 from datetime import datetime, timezone, timedelta
-from db import db_manager
+from db import db_manager, User, WalletBalance
 from logging_config import get_trading_logger
 from typing import Any
+import bcrypt
+from settings import validate_env
 
 # Page configuration
 st.set_page_config(
@@ -16,9 +18,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# -------------------------
 # Global theme (hybrid): small CSS injection to style buttons, headings, tables, and mimic Binance feel
-# -------------------------
 GLOBAL_CSS = """
 <style>
 /* Background and card feel - WHITE THEME */
@@ -37,9 +37,7 @@ h1, h2, h3, h4, h5 { color: #a8b7e7ff !important; }
 """
 st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
 
-# -------------------------
 # Helpers — defensive conversions so we never rely on SQLAlchemy truthiness
-# -------------------------
 def is_datetime(value: Any) -> bool:
     return isinstance(value, datetime)
 
@@ -82,9 +80,7 @@ def format_price(value: float) -> str:
     else:
         return f"${value / 1000000000:.2f}B"
 
-# -------------------------
 # Styling helpers (Binance-style: dark-ish header, yellow accents)
-# -------------------------
 BANNER_HTML = """
 <div style="background-color:#f8f9fa;padding:12px;border-radius:8px;margin-bottom:8px;border:1px solid #dee2e6;">
   <h2 style="color:#a8b7e7ff;margin:0 0 4px 0">💰 Trading Operations</h2>
@@ -100,27 +96,130 @@ def highlight_pnl_html(val_str: str) -> str:
     color = "#2ecc71" if v > 0 else "#ff4d4f" if v < 0 else "#b0b0b0"
     return f'<span style="color:{color};font-weight:600">{val_str}</span>'
 
-# -------------------------
 # Initialize components & logger
-# -------------------------
 logger = get_trading_logger(__name__)
 
+# Authentication
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
+# Authentication functions
+def authenticate_user(username: str, password: str) -> bool:
+    """Authenticate user against the database with hashed password."""
+    try:
+        with db_manager.get_session() as session:
+            user = session.query(User).filter_by(username=username).first()
+            if user and bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
+                st.session_state.user = {'id': user.id, 'username': user.username}
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"Authentication error for {username}: {e}")
+        return False
+
+def register_user(username: str, password: str) -> bool:
+    """Register a new user with hashed password and initialize wallet balances."""
+    try:
+        with db_manager.get_session() as session:
+            if session.query(User).filter_by(username=username).first():
+                logger.warning(f"Registration failed: Username {username} already exists")
+                return False
+            
+            hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            
+            new_user = User(
+                username=username,
+                password_hash=hashed_password,
+                binance_api_key=None,
+                binance_api_secret=None,
+                bybit_api_key=None,
+                bybit_api_secret=None
+            )
+            session.add(new_user)
+            session.commit()
+
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="virtual",
+                available=100.0,
+                used=0.0,
+                total=100.0,
+                currency="USDT",
+                exchange=st.session_state.get('current_exchange', 'binance')
+            ))
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="real",
+                available=0.0,
+                used=0.0,
+                total=0.0,
+                currency="USDT",
+                exchange=st.session_state.get('current_exchange', 'binance')
+            ))
+            session.commit()
+            logger.info(f"Registered new user: {username}, ID: {new_user.id}")
+            return True
+    except Exception as e:
+        logger.error(f"Registration error for {username}: {e}")
+        session.rollback()
+        return False
+
+# Login/Register UI
+if not st.session_state.get('authenticated', False):
+    st.markdown("### 🔐 Login or Register")
+    login_tab, register_tab = st.tabs(["Login", "Register"])
+
+    with login_tab:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit_login = st.form_submit_button("Login")
+            if submit_login:
+                if authenticate_user(username, password):
+                    st.session_state.authenticated = True
+                    st.success(f"Welcome, {username}!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+
+    with register_tab:
+        with st.form("register_form"):
+            new_username = st.text_input("New Username")
+            new_password = st.text_input("New Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            submit_register = st.form_submit_button("Register")
+            if submit_register:
+                if new_password == confirm_password:
+                    if register_user(new_username, new_password):
+                        st.success("Registration successful! Please login.")
+                    else:
+                        st.error("Registration failed. Username may already exist.")
+                else:
+                    st.error("Passwords do not match")
+
+    st.stop()
+
 # Initialize required session_state objects
-if 'trading_engine' not in st.session_state or 'current_exchange' not in st.session_state:
-    st.error("Trading engine not initialized. Please restart the application.")
+if 'trading_engine' not in st.session_state or st.session_state.trading_engine is None:
+    st.error("Trading engine not initialized. Please return to the main page to initialize the application.")
     st.stop()
 
 trading_engine = st.session_state.trading_engine
-current_exchange = st.session_state.current_exchange
+current_exchange = st.session_state.get('current_exchange', 'binance')
 account_type = st.session_state.get('account_type', 'virtual')
 automated_trader = st.session_state.get('automated_trader')
+user_id = st.session_state.user.get('id') if st.session_state.user else None
+
+if not user_id:
+    st.error("User not authenticated. Please log in from the main page.")
+    st.stop()
 
 # Render header banner (Binance-style)
 st.markdown(BANNER_HTML, unsafe_allow_html=True)
 
-# -------------------------
 # Trade statistics overview
-# -------------------------
 st.subheader("📊 Trade Overview")
 
 try:
@@ -145,19 +244,19 @@ except Exception as e:
 
 st.divider()
 
-# -------------------------
 # Automation controls
-# -------------------------
 st.subheader("🤖 Automated Trading")
 col1, col2, col3, col4 = st.columns(4)
 
 if automated_trader:
     try:
         trader_status = automated_trader.get_status() or {}
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error fetching trader status: {e}")
         trader_status = {}
 
     is_running = bool(trader_status.get('running', False))
+    is_real_trading_enabled = account_type == 'real' and validate_env(current_exchange, allow_virtual=False)
 
     with col1:
         if is_running:
@@ -199,32 +298,39 @@ with col1:
                         st.error("Failed to stop automation")
                 except Exception as e:
                     logger.error(f"Stop automation failed: {e}")
-                    st.error("Failed to stop automation")
+                    st.error(f"Failed to stop automation: {e}")
         else:
-            if st.button("▶️ Start Automation", type="primary"):
+            disabled = account_type == 'real' and not is_real_trading_enabled
+            if st.button("▶️ Start Automation", type="primary", disabled=disabled):
                 try:
-                    if automated_trader.start():
-                        st.success("Automated trading started")
+                    if account_type == 'real' and not is_real_trading_enabled:
+                        st.error(f"Real trading requires {current_exchange.upper()} API credentials")
+                    elif automated_trader.start():
+                        st.success(f"Automated {account_type.title()} trading started")
                         st.rerun()
                     else:
                         st.error("Failed to start automation")
                 except Exception as e:
                     logger.error(f"Start automation failed: {e}")
-                    st.error("Failed to start automation")
+                    st.error(f"Failed to start automation: {e}")
 
 with col2:
     if automated_trader:
-        if st.button("⚡ Force Scan"):
+        disabled = account_type == 'real' and not is_real_trading_enabled
+        if st.button("⚡ Force Scan", disabled=disabled):
             try:
-                result = automated_trader.force_scan()
-                if isinstance(result, dict) and result.get('success'):
-                    st.success(result.get('message', 'Scan completed'))
-                    st.rerun()
+                if account_type == 'real' and not is_real_trading_enabled:
+                    st.error(f"Real trading requires {current_exchange.upper()} API credentials")
                 else:
-                    st.error(result.get('error', 'Scan failed') if isinstance(result, dict) else 'Scan failed')
+                    result = automated_trader.force_scan()
+                    if isinstance(result, dict) and result.get('success'):
+                        st.success(result.get('message', 'Scan completed'))
+                        st.rerun()
+                    else:
+                        st.error(result.get('error', 'Scan failed') if isinstance(result, dict) else 'Scan failed')
             except Exception as e:
                 logger.error(f"Force scan error: {e}")
-                st.error("Force scan failed")
+                st.error(f"Force scan failed: {e}")
 
 with col3:
     with st.expander("⚙️ Automation Settings"):
@@ -269,266 +375,108 @@ with col3:
                         st.error("Failed to update settings")
                 except Exception as e:
                     logger.error(f"Update settings failed: {e}")
-                    st.error("Failed to save settings")
+                    st.error(f"Failed to save settings: {e}")
 
 st.divider()
 
-# -------------------------
 # Trade management tabs
-# -------------------------
 tab1, tab2, tab3, tab4 = st.tabs(["Open Positions", "Closed Trades", "Manual Trading", "Performance Analytics"])
 
-# ---------- Open Positions ----------
+# Open Positions
 with tab1:
     st.subheader("🔓 Open Positions")
 
-    # Interactive filters for open positions
     col_filter, col_refresh = st.columns([3, 1])
     with col_filter:
-        # symbol_filter = st.selectbox("Filter symbol", options=["All"], index=0, key="open_symbol_filter") # old
-        side_filter = st.selectbox("Side", options=["All", "BUY", "SELL", "LONG", "SHORT"], index=0, key="open_side_filter")
+        symbol_filter = st.text_input("Filter by Symbol (e.g., BTCUSDT)", "").upper()
     with col_refresh:
-        refresh_interval = st.selectbox(
-            "Auto-refresh",
-            [0, 5, 10, 30, 60],
-            index=0,
-            format_func=lambda x: "Off" if x == 0 else f"Every {x} seconds",
-            key="open_refresh"
-        )
+        if st.button("🔄 Refresh"):
+            st.rerun()
 
     try:
-        is_virtual = (account_type == 'virtual')
-        open_trades = db_manager.get_trades(status='open', virtual=is_virtual, exchange=current_exchange, limit=1000)
-
-        # populate symbol filter options dynamically
-        symbols = sorted({safe_str(t.symbol) for t in open_trades if getattr(t, "symbol", None)})
-        symbol_filter_opts = ["All"] + symbols
-        # replace previously selected if needed
-        if "open_positions_symbol_filter" in st.session_state and st.session_state.open_positions_symbol_filter not in symbol_filter_opts:
-            st.session_state.open_positions_symbol_filter = "All"
-        symbol_filter = st.selectbox(
-            "Filter by Symbol",
-            ["All"] + list(set([t.symbol for t in open_trades])),
-            key='open_positions_symbol_filter'
+        trades = db_manager.get_trades(
+            status='open',
+            virtual=(account_type == 'virtual'),
+            exchange=current_exchange,
+            user_id=user_id,
+            symbol=symbol_filter if symbol_filter else None
         )
-
-
-        # Filter trades defensively
-        def open_trade_matches(t):
-            s_ok = (symbol_filter == "All") or (safe_str(getattr(t, "symbol", "")).upper() == str(symbol_filter).upper())
-            side_val = safe_str(getattr(t, "side", ""))
-            side_ok = (side_filter == "All") or (side_val.upper() == side_filter.upper())
-            return s_ok and side_ok
-
-        filtered_open = [t for t in open_trades if open_trade_matches(t)]
-
-        if filtered_open:
-            # Start websocket best-effort
-            try:
-                ws_symbols = list({safe_str(t.symbol) for t in filtered_open})
-                trading_engine.client.start_websocket(ws_symbols)
-            except Exception:
-                pass
-
-            # Build table rows
-            rows = []
-            for t in filtered_open:
+        if trades:
+            data = []
+            for t in trades:
+                current_price = safe_float(trading_engine.get_current_price(t.symbol), 0.0) if hasattr(t, "symbol") else 0.0
+                entry_price = safe_float(getattr(t, "entry_price", 0.0))
                 qty = safe_float(getattr(t, "qty", 0.0))
-                entry = safe_float(getattr(t, "entry_price", 0.0))
-                current_price = safe_float(trading_engine.client.get_current_price(getattr(t, "symbol", "")) or 0.0)
-                pnl_val = 0.0
-                if is_virtual:
-                    try:
-                        pnl_val = safe_float(trading_engine.calculate_virtual_pnl({
-                            "symbol": getattr(t, "symbol", ""),
-                            "entry_price": entry,
-                            "qty": qty,
-                            "side": getattr(t, "side", "")
-                        }), 0.0)
-                    except Exception:
-                        pnl_val = safe_float(getattr(t, "pnl", 0.0))
+                side = safe_str(getattr(t, "side", "N/A")).upper()
+                if side in ["BUY", "LONG"]:
+                    unrealized_pnl = (current_price - entry_price) * qty
                 else:
-                    pnl_val = safe_float(getattr(t, "pnl", 0.0))
-
-                opened = getattr(t, "created_at", None)
-                rows.append({
-                    "ID": int(getattr(t, "id", 0) or 0),
+                    unrealized_pnl = (entry_price - current_price) * qty
+                data.append({
                     "Symbol": safe_str(getattr(t, "symbol", "N/A")),
-                    "Side": safe_str(getattr(t, "side", "N/A")),
+                    "Side": side,
                     "Quantity": f"{qty:.6f}",
-                    "Entry Price": f"${entry:.6f}",
-                    "Current Price": f"${current_price:.6f}",
-                    "Current P&L": format_price(pnl_val),
-                    "TP": f"${safe_float(getattr(t, 'tp', None)):.6f}" if getattr(t, 'tp', None) is not None else "N/A",
-                    "SL": f"${safe_float(getattr(t, 'sl', None)):.6f}" if getattr(t, 'sl', None) is not None else "N/A",
-                    "Opened": safe_dt(opened)
+                    "Entry Price": format_price(entry_price),
+                    "Current Price": format_price(current_price),
+                    "Unrealized P&L": format_price(unrealized_pnl),
+                    "Opened": safe_dt(getattr(t, "created_at", None))
                 })
-
-            df = pd.DataFrame(rows)
-
-            # Allow sorting by user choice
-            sort_by = st.selectbox("Sort by", options=["ID", "Symbol", "Current P&L", "Opened"], index=0, key="open_sort_by")
-            ascending = st.checkbox("Ascending", value=False, key="open_asc")
-            if sort_by in df.columns:
-                # convert P&L to numeric for sorting
-                if sort_by == "Current P&L":
-                    df["_pnl_sort"] = df["Current P&L"].apply(lambda x: safe_float(str(x).replace("$", "").replace(",", "").replace("K", "000").replace("M", "000000").replace("B", "000000000"), 0.0))
-                    df = df.sort_values(by="_pnl_sort", ascending=ascending).drop(columns=["_pnl_sort"])
-                else:
-                    df = df.sort_values(by=sort_by, ascending=ascending)
-
-            # display as styled HTML table with colored P&L (Binance-style colors)
-            def df_to_html_table(dframe: pd.DataFrame) -> str:
-                headers = "".join([f"<th style='padding:6px 10px;background:#f8f9fa;color:#a8b7e7ff;border-bottom:2px solid #dee2e6'>{h}</th>" for h in dframe.columns])
-                rows_html = []
-                for _, r in dframe.iterrows():
-                    cols = []
-                    for col in dframe.columns:
-                        v = r[col]
-                        if col in ["Current P&L", "P&L"]:
-                            v_html = highlight_pnl_html(str(v))
-                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #dee2e6'>{v_html}</td>")
-                        else:
-                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #dee2e6;color:#1a1a1a'>{v}</td>")
-                    rows_html.append("<tr>" + "".join(cols) + "</tr>")
-                table = f"""
-                <table style='width:100%;border-collapse:collapse;margin-top:8px;background:#ffffff'>
-                  <thead><tr>{headers}</tr></thead>
-                  <tbody>{''.join(rows_html)}</tbody>
-                </table>
-                """
-                return table
-
-            st.markdown(df_to_html_table(df), unsafe_allow_html=True)
-
-            # allow user to inspect a trade in detail
-            ids = [f"{r['ID']} - {r['Symbol']}" for r in rows]
-            selection = st.selectbox("Select position to inspect", options=ids, index=0, key="open_selected_position")
-            if selection:
-                sel_id = int(selection.split(" - ")[0])
-                sel_trade = next((t for t in filtered_open if int(getattr(t, "id", 0) or 0) == sel_id), None)
-                if sel_trade:
-                    with st.expander("Trade Details", expanded=True):
-                        st.write("**Basic Info**")
-                        st.write(f"ID: {int(getattr(sel_trade, 'id', 0) or 0)}")
-                        st.write(f"Symbol: {safe_str(getattr(sel_trade, 'symbol', 'N/A'))}")
-                        st.write(f"Side: {safe_str(getattr(sel_trade, 'side', 'N/A'))}")
-                        st.write(f"Quantity: {safe_float(getattr(sel_trade, 'qty', 0.0)):.6f}")
-                        st.write(f"Entry Price: ${safe_float(getattr(sel_trade, 'entry_price', 0.0)):.6f}")
-                        st.write(f"Current Price: ${safe_float(trading_engine.client.get_current_price(getattr(sel_trade, 'symbol', '')) or 0.0):.6f}")
-                        st.write(f"TP: {safe_str(getattr(sel_trade, 'tp', 'N/A'))}")
-                        st.write(f"SL: {safe_str(getattr(sel_trade, 'sl', 'N/A'))}")
-                        st.write(f"Opened: {safe_dt(getattr(sel_trade, 'created_at', None))}")
-                        st.write(f"Raw indicators: {getattr(sel_trade, 'indicators', {})}")
-
-                        # Close position UI (keep interactive, but ask for price before action)
-                        close_price_input_key = f"close_price_{sel_id}"
-                        chosen_close_price = st.number_input(
-                            "Close price for this trade",
-                            min_value=0.000001,
-                            value=float(safe_float(trading_engine.client.get_current_price(getattr(sel_trade, 'symbol', '')) or 0.0)),
-                            format="%.6f",
-                            key=close_price_input_key
-                        )
-                        if st.button("🔒 Close This Position (virtual)", key=f"close_btn_{sel_id}"):
-                            try:
-                                pos_id = int(getattr(sel_trade, "id", 0) or 0)
-                                if trading_engine.close_virtual_trade(pos_id, float(chosen_close_price)):
-                                    st.success("Position closed")
-                                    st.rerun()
-                                else:
-                                    st.error("Failed to close position")
-                            except Exception as e:
-                                logger.error(f"Close position failed: {e}")
-                                st.error("Failed to close position")
-
+            df_open = pd.DataFrame(data)
+            st.dataframe(df_open, use_container_width=True, height=300)
         else:
-            st.info("No open positions")
-
+            st.info("No open positions found")
     except Exception as e:
         logger.error(f"Error loading open positions: {e}")
         st.error(f"Error loading open positions: {e}")
 
-    # Auto-refresh
-    if refresh_interval > 0:
-        time.sleep(refresh_interval)
-        st.rerun()
-
-# ---------- Closed Trades ----------
+# Closed Trades
 with tab2:
-    st.subheader("✅ Closed Trades")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        trade_type = st.selectbox("Trade Type", ["Virtual", "Real", "All"], index=2, key="closed_trade_type")
-    with col2:
-        days_back = st.selectbox("Time Period (days)", [1, 7, 30, 90], index=2, key="closed_days_back")
-    with col3:
-        min_pnl = st.number_input("Min P&L ($)", value=0.0, step=0.01, key="closed_min_pnl")
+    st.subheader("🔒 Closed Trades")
+
+    col_filter, col_refresh = st.columns([3, 1])
+    with col_filter:
+        symbol_filter_closed = st.text_input("Filter by Symbol (e.g., BTCUSDT)", key="closed_symbol_filter").upper()
+    with col_refresh:
+        if st.button("🔄 Refresh", key="closed_refresh"):
+            st.rerun()
 
     try:
-        is_virtual = (trade_type == "Virtual") or (trade_type == "All" and account_type == 'virtual')
-        raw_closed = db_manager.get_trades(status='closed', virtual=is_virtual, exchange=current_exchange, limit=2000)
-
-        cutoff = datetime.now(timezone.utc) - timedelta(days=int(days_back))
-
-        def is_within_cutoff(t):
-            updated = getattr(t, "updated_at", None)
-            created = getattr(t, "created_at", None)
-            reference = updated if is_datetime(updated) else (created if is_datetime(created) else None)
-            return reference is not None and reference >= cutoff
-
-        trades = [t for t in raw_closed if is_within_cutoff(t)]
-
-        # Apply min_pnl filter
-        def pnl_ok(t):
-            return safe_float(getattr(t, "pnl", 0.0), 0.0) >= float(min_pnl)
-
-        trades = [t for t in trades if pnl_ok(t)]
-
+        trades = db_manager.get_trades(
+            status='closed',
+            virtual=(account_type == 'virtual'),
+            exchange=current_exchange,
+            user_id=user_id,
+            symbol=symbol_filter_closed if symbol_filter_closed else None,
+            limit=2000
+        )
         if trades:
-            rows = []
-            for t in trades[:500]:
-                updated = getattr(t, "updated_at", None)
-                created = getattr(t, "created_at", None)
-                closed_ref = updated if is_datetime(updated) else created
-                closed_str = safe_dt(closed_ref)
-                duration = "N/A"
-                if is_datetime(created) and is_datetime(closed_ref):
-                    if closed_ref and created:
-                        duration_delta = closed_ref - created
-                        duration = str(duration_delta).split('.')[0]  # Remove microseconds
-                    else:
-                        duration = "0:00:00"
-
-
-                rows.append({
-                    "ID": int(getattr(t, "id", 0) or 0),
-                    "Type": "Virtual" if getattr(t, "virtual", False) else "Real",
+            data = []
+            for t in trades:
+                data.append({
                     "Symbol": safe_str(getattr(t, "symbol", "N/A")),
-                    "Side": safe_str(getattr(t, "side", "N/A")),
+                    "Side": safe_str(getattr(t, "side", "N/A")).upper(),
                     "Quantity": f"{safe_float(getattr(t, 'qty', 0.0)):.6f}",
-                    "Entry": f"${safe_float(getattr(t, 'entry_price', 0.0)):.6f}",
-                    "Exit": f"${safe_float(getattr(t, 'exit_price', 0.0)):.6f}" if getattr(t, "exit_price", None) is not None else "N/A",
-                    "P&L": format_price(safe_float(getattr(t, 'pnl', 0.0))),
-                    "Duration": duration,
-                    "Closed": closed_str
+                    "Entry Price": format_price(safe_float(getattr(t, "entry_price", 0.0))),
+                    "Exit Price": format_price(safe_float(getattr(t, "exit_price", 0.0))),
+                    "P&L": format_price(safe_float(getattr(t, "pnl", 0.0))),
+                    "Closed": safe_dt(getattr(t, "updated_at", None) or getattr(t, "created_at", None))
                 })
+            df_closed = pd.DataFrame(data)
 
-            df_closed = pd.DataFrame(rows)
-            # show styled HTML (colored P&L)
-            def html_for_closed(dfc: pd.DataFrame) -> str:
-                headers = "".join([f"<th style='padding:6px 10px;background:#f8f9fa;color:#a8b7e7ff;border-bottom:2px solid #dee2e6'>{h}</th>" for h in dfc.columns])
+            def html_for_closed(df: pd.DataFrame) -> str:
+                headers = "".join(f"<th style='background:#f8f9fa;padding:8px;border-bottom:2px solid #dee2e6;color:#1a1a1a'>{col}</th>" for col in df.columns)
                 rows_html = []
-                for _, r in dfc.iterrows():
-                    cols = []
-                    for col in dfc.columns:
-                        v = r[col]
-                        if col == "P&L":
-                            v_html = highlight_pnl_html(str(v))
-                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #dee2e6'>{v_html}</td>")
-                        else:
-                            cols.append(f"<td style='padding:6px 10px;border-bottom:1px solid #dee2e6;color:#1a1a1a'>{v}</td>")
-                    rows_html.append("<tr>" + "".join(cols) + "</tr>")
+                for _, row in df.iterrows():
+                    cells = [
+                        f"<td style='padding:8px;border-bottom:1px solid #dee2e6'>{row['Symbol']}</td>",
+                        f"<td style='padding:8px;border-bottom:1px solid #dee2e6;color:{'#2ecc71' if row['Side'] in ['BUY', 'LONG'] else '#ff4d4f'}'>{row['Side']}</td>",
+                        f"<td style='padding:8px;border-bottom:1px solid #dee2e6'>{row['Quantity']}</td>",
+                        f"<td style='padding:8px;border-bottom:1px solid #dee2e6'>{row['Entry Price']}</td>",
+                        f"<td style='padding:8px;border-bottom:1px solid #dee2e6'>{row['Exit Price']}</td>",
+                        f"<td style='padding:8px;border-bottom:1px solid #dee2e6'>{highlight_pnl_html(row['P&L'])}</td>",
+                        f"<td style='padding:8px;border-bottom:1px solid #dee2e6'>{row['Closed']}</td>",
+                    ]
+                    rows_html.append(f"<tr>{''.join(cells)}</tr>")
                 table = f"<table style='width:100%;border-collapse:collapse;margin-top:8px;background:#ffffff'><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html)}</tbody></table>"
                 return table
 
@@ -575,14 +523,17 @@ with tab2:
         logger.error(f"Error loading closed trades: {e}")
         st.error(f"Error loading closed trades: {e}")
 
-# ---------- Manual Trading ----------
+# Manual Trading
 with tab3:
     st.subheader("🎯 Manual Trading")
-    st.warning("⚠️ Manual trading is for virtual accounts only in this version")
+    if account_type == 'real' and not validate_env(current_exchange, allow_virtual=False):
+        st.warning(f"⚠️ Real trading requires {current_exchange.upper()} API credentials. Only virtual trading is available.")
+    else:
+        st.info(f"{'Virtual' if account_type == 'virtual' else 'Real'} trading mode active on {current_exchange.title()}")
 
     col1, col2 = st.columns(2)
     with col1:
-        st.write("**Virtual Trade Entry:**")
+        st.write("**Trade Entry:**")
         symbol = st.text_input("Symbol", value="BTCUSDT")
         side = st.selectbox("Side", ["BUY", "SELL", "LONG", "SHORT"])
         entry_price = st.number_input("Entry Price", min_value=0.000001, value=1.0, step=0.000001, format="%.6f")
@@ -596,7 +547,8 @@ with tab3:
         tp_price = st.number_input("Take Profit", min_value=0.0, value=0.0, step=0.000001, format="%.6f")
         sl_price = st.number_input("Stop Loss", min_value=0.0, value=0.0, step=0.000001, format="%.6f")
 
-        if st.button("📈 Execute Trade", type="primary"):
+        disabled = account_type == 'real' and not validate_env(current_exchange, allow_virtual=False)
+        if st.button("📈 Execute Trade", type="primary", disabled=disabled):
             try:
                 signal = {
                     'symbol': symbol,
@@ -608,11 +560,16 @@ with tab3:
                     'margin_usdt': 5.0,
                     'trail': 0.0,
                     'market': 'Manual',
-                    'indicators': {}
+                    'indicators': {},
+                    'user_id': user_id,
+                    'exchange': current_exchange
                 }
-                executed = trading_engine.execute_virtual_trade(signal)
+                if account_type == 'virtual':
+                    executed = trading_engine.execute_virtual_trade(signal)
+                else:
+                    executed = trading_engine.execute_trade(signal)
                 if executed:
-                    st.success(f"Trade executed: {side} {quantity} {symbol} at ${entry_price}")
+                    st.success(f"{'Virtual' if account_type == 'virtual' else 'Real'} trade executed: {side} {quantity} {symbol} at ${entry_price} on {current_exchange.title()}")
                     st.rerun()
                 else:
                     st.error("Failed to execute trade")
@@ -623,8 +580,8 @@ with tab3:
     with col2:
         st.write("**Trade Calculator:**")
         try:
-            wallet = db_manager.get_wallet_balance(account_type)
-            balance = safe_float(getattr(wallet, "available", None), default=100.0) if wallet else 100.0
+            wallet = db_manager.get_wallet_balance(account_type, user_id=user_id, exchange=current_exchange)
+            balance = safe_float(wallet.get('available'), 100.0 if account_type == 'virtual' else 0.0)
             st.metric("Available Balance", format_price(balance))
 
             risk_percent = st.slider("Risk %", 0.1, 10.0, 1.0, 0.1)
@@ -656,7 +613,7 @@ with tab3:
             logger.error(f"Error in trade calculator: {e}")
             st.error(f"Error in trade calculator: {e}")
 
-# ---------- Performance Analytics ----------
+# Performance Analytics
 with tab4:
     st.subheader("📊 Performance Analytics")
     try:
@@ -673,12 +630,16 @@ with tab4:
                 min_value=start_date
             )
 
-        raw_trades = db_manager.get_trades(virtual=(account_type == 'virtual'), exchange=current_exchange, limit=2000)
+        raw_trades = db_manager.get_trades(
+            virtual=(account_type == 'virtual'),
+            exchange=current_exchange,
+            user_id=user_id,
+            limit=2000
+        )
 
         def in_date_range(t):
             ref = getattr(t, "updated_at", None) or getattr(t, "created_at", None)
             return isinstance(ref, datetime) and start_date <= ref.date() <= end_date
-
 
         filtered_trades = [t for t in raw_trades if in_date_range(t)]
 
@@ -719,7 +680,7 @@ with tab4:
                 updated = getattr(t, "updated_at", None)
                 if is_datetime(created) and is_datetime(updated):
                     try:
-                        dur_hours = (updated - created).total_seconds() / 3600 if isinstance(updated, datetime) and isinstance(created, datetime) else 0.0
+                        dur_hours = (updated - created).total_seconds() / 3600
                         durations.append(dur_hours)
                     except Exception:
                         continue
@@ -739,9 +700,15 @@ with tab4:
         logger.error(f"Error loading performance analytics: {e}")
         st.error(f"Error loading performance analytics: {e}")
 
-# ----- Status footer -----
+# Status footer
 try:
-    open_count = len(db_manager.get_trades(status='open', virtual=(account_type == 'virtual'), exchange=current_exchange, limit=2000))
+    open_count = len(db_manager.get_trades(
+        status='open',
+        virtual=(account_type == 'virtual'),
+        exchange=current_exchange,
+        user_id=user_id,
+        limit=2000
+    ))
 except Exception:
     open_count = 0
 

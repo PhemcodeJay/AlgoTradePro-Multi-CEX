@@ -3,9 +3,10 @@ import json
 import os
 from typing import Dict, Any
 from datetime import datetime, timezone
-from db import DatabaseManager
+from db import db_manager, User, WalletBalance
 from settings import load_settings, save_settings, validate_env
 from logging_config import get_trading_logger
+import bcrypt
 
 # Page configuration
 st.set_page_config(
@@ -14,18 +15,124 @@ st.set_page_config(
     layout="wide"
 )
 
+# Initialize logger
+logger = get_trading_logger(__name__)
+
+# Initialize session state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
+# Authentication functions
+def authenticate_user(username: str, password: str) -> bool:
+    """Authenticate user against the database with hashed password."""
+    try:
+        with db_manager.get_session() as session:
+            user = session.query(User).filter_by(username=username).first()
+            if user and bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
+                st.session_state.user = {'id': user.id, 'username': user.username}
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"Authentication error for {username}: {e}")
+        return False
+
+def register_user(username: str, password: str) -> bool:
+    """Register a new user with hashed password and initialize wallet balances."""
+    try:
+        with db_manager.get_session() as session:
+            if session.query(User).filter_by(username=username).first():
+                logger.warning(f"Registration failed: Username {username} already exists")
+                return False
+            
+            hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            
+            new_user = User(
+                username=username,
+                password_hash=hashed_password,
+                binance_api_key=None,
+                binance_api_secret=None,
+                bybit_api_key=None,
+                bybit_api_secret=None
+            )
+            session.add(new_user)
+            session.commit()
+
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="virtual",
+                available=100.0,
+                used=0.0,
+                total=100.0,
+                currency="USDT",
+                exchange=st.session_state.get('current_exchange', 'binance')
+            ))
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="real",
+                available=0.0,
+                used=0.0,
+                total=0.0,
+                currency="USDT",
+                exchange=st.session_state.get('current_exchange', 'binance')
+            ))
+            session.commit()
+            logger.info(f"Registered new user: {username}, ID: {new_user.id}")
+            return True
+    except Exception as e:
+        logger.error(f"Registration error for {username}: {e}")
+        session.rollback()
+        return False
+
+# Login/Register UI
+if not st.session_state.get('authenticated', False):
+    st.markdown("### 🔐 Login or Register")
+    login_tab, register_tab = st.tabs(["Login", "Register"])
+
+    with login_tab:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit_login = st.form_submit_button("Login")
+            if submit_login:
+                if authenticate_user(username, password):
+                    st.session_state.authenticated = True
+                    st.success(f"Welcome, {username}!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+
+    with register_tab:
+        with st.form("register_form"):
+            new_username = st.text_input("New Username")
+            new_password = st.text_input("New Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            submit_register = st.form_submit_button("Register")
+            if submit_register:
+                if new_password == confirm_password:
+                    if register_user(new_username, new_password):
+                        st.success("Registration successful! Please login.")
+                    else:
+                        st.error("Registration failed. Username may already exist.")
+                else:
+                    st.error("Passwords do not match")
+
+    st.stop()
+
 # Initialize components
-if 'trading_engine' not in st.session_state or 'current_exchange' not in st.session_state:
-    st.error("Trading engine not initialized. Please restart the application.")
+if 'trading_engine' not in st.session_state or st.session_state.trading_engine is None:
+    st.error("Trading engine not initialized. Please return to the main page to initialize the application.")
     st.stop()
 
 trading_engine = st.session_state.trading_engine
-db_manager = DatabaseManager()
-current_exchange = st.session_state.current_exchange
+current_exchange = st.session_state.get('current_exchange', 'binance')
 account_type = st.session_state.get('account_type', 'virtual')
+user_id = st.session_state.user.get('id') if st.session_state.user else None
 
-# Initialize logger
-logger = get_trading_logger(__name__)
+if not user_id:
+    st.error("User not authenticated. Please log in from the main page.")
+    st.stop()
 
 # Header with card
 st.markdown("""
@@ -35,8 +142,8 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Load current settings
-current_settings = load_settings()
+# Load user-specific settings
+current_settings = load_settings(user_id=user_id) or {}
 
 # Quick Info Cards
 st.markdown("### 📋 Quick Information")
@@ -59,7 +166,7 @@ with col2:
     """, unsafe_allow_html=True)
 
 with col3:
-    api_status = "✅ Connected" if validate_env(current_exchange, allow_virtual=False) else "🔒 Virtual Only"
+    api_status = "✅ Connected" if validate_env(current_exchange, allow_virtual=False, user_id=user_id) else "🔒 Virtual Only"
     st.markdown(f"""
     <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #10b981;'>
         <h4 style='margin: 0; color: #10b981;'>🔐 API Status</h4>
@@ -196,12 +303,12 @@ with tab2:
         </div>
         """, unsafe_allow_html=True)
 
-        binance_has_keys = validate_env("binance", allow_virtual=False)
+        binance_has_keys = validate_env("binance", allow_virtual=False, user_id=user_id)
         if binance_has_keys:
             st.success("✅ API Configured")
         else:
             st.warning("🔒 Virtual Mode Only")
-            st.caption("Add BINANCE_API_KEY and BINANCE_API_SECRET to .env for real trading")
+            st.caption("Add Binance API keys below to enable real trading")
 
     with col2:
         st.markdown("""
@@ -210,71 +317,95 @@ with tab2:
         </div>
         """, unsafe_allow_html=True)
 
-        bybit_has_keys = validate_env("bybit", allow_virtual=False)
+        bybit_has_keys = validate_env("bybit", allow_virtual=False, user_id=user_id)
         if bybit_has_keys:
             st.success("✅ API Configured")
         else:
             st.warning("🔒 Virtual Mode Only")
-            st.caption("Add BYBIT_API_KEY and BYBIT_API_SECRET to .env for real trading")
+            st.caption("Add Bybit API keys below to enable real trading")
 
-    st.markdown("---") # Separator
+    st.markdown("---")  # Separator
 
     # API Key Input Section
     with st.expander("🔑 API Credentials", expanded=True):
         st.markdown(f"### {current_exchange.upper()} API Keys")
 
+        try:
+            with db_manager.get_session() as session:
+                user = session.query(User).filter_by(id=user_id).first()
+                binance_api_key = user.binance_api_key or ""
+                binance_api_secret = user.binance_api_secret or ""
+                bybit_api_key = user.bybit_api_key or ""
+                bybit_api_secret = user.bybit_api_secret or ""
+        except Exception as e:
+            logger.error(f"Error fetching user API keys: {e}")
+            st.error(f"Error fetching API keys: {e}")
+            binance_api_key = binance_api_secret = bybit_api_key = bybit_api_secret = ""
+
         if current_exchange == "binance":
             api_key = st.text_input(
                 "Binance API Key",
-                value=os.environ.get("BINANCE_API_KEY", ""),
+                value=binance_api_key,
                 type="password",
                 key="binance_api_key_input"
             )
             api_secret = st.text_input(
                 "Binance API Secret",
-                value=os.environ.get("BINANCE_API_SECRET", ""),
+                value=binance_api_secret,
                 type="password",
                 key="binance_api_secret_input"
             )
 
             if st.button("💾 Save Binance API Keys", type="primary"):
                 if api_key and api_secret:
-                    if update_env_variable("BINANCE_API_KEY", api_key):
-                        if update_env_variable("BINANCE_API_SECRET", api_secret):
+                    try:
+                        with db_manager.get_session() as session:
+                            user = session.query(User).filter_by(id=user_id).first()
+                            user.binance_api_key = api_key
+                            user.binance_api_secret = api_secret
+                            session.commit()
                             st.success("✅ Binance API keys saved successfully! Please restart the app for changes to take effect.")
                             st.info("Click the Stop button and then Run button to restart.")
+                    except Exception as e:
+                        logger.error(f"Error saving Binance API keys: {e}")
+                        st.error(f"Error saving API keys: {e}")
                 else:
                     st.error("Please provide both API Key and Secret")
 
         elif current_exchange == "bybit":
             api_key = st.text_input(
                 "Bybit API Key",
-                value=os.environ.get("BYBIT_API_KEY", ""),
+                value=bybit_api_key,
                 type="password",
                 key="bybit_api_key_input"
             )
             api_secret = st.text_input(
                 "Bybit API Secret",
-                value=os.environ.get("BYBIT_API_SECRET", ""),
+                value=bybit_api_secret,
                 type="password",
                 key="bybit_api_secret_input"
             )
 
             if st.button("💾 Save Bybit API Keys", type="primary"):
                 if api_key and api_secret:
-                    if update_env_variable("BYBIT_API_KEY", api_key):
-                        if update_env_variable("BYBIT_API_SECRET", api_secret):
+                    try:
+                        with db_manager.get_session() as session:
+                            user = session.query(User).filter_by(id=user_id).first()
+                            user.bybit_api_key = api_key
+                            user.bybit_api_secret = api_secret
+                            session.commit()
                             st.success("✅ Bybit API keys saved successfully! Please restart the app for changes to take effect.")
                             st.info("Click the Stop button and then Run button to restart.")
+                    except Exception as e:
+                        logger.error(f"Error saving Bybit API keys: {e}")
+                        st.error(f"Error saving API keys: {e}")
                 else:
                     st.error("Please provide both API Key and Secret")
 
     st.markdown("""
     ### API Configuration
-
     You can also use the Secrets tool (🔒) in the sidebar to add your API keys securely.
     """)
-
 
 with tab3:
     st.markdown("### ⚠️ Risk Management")
@@ -358,52 +489,37 @@ with tab4:
 
     # Notification Settings
     with st.expander("🔔 Configure Notifications", expanded=False):
+        notification_enabled = st.checkbox(
+            "Enable Notifications",
+            value=current_settings.get("NOTIFICATION_ENABLED", True),
+            help="Enable or disable all notifications"
+        )
+
         discord_webhook = st.text_input(
             "Discord Webhook URL",
-            value=os.environ.get("DISCORD_WEBHOOK_URL", ""),
+            value=current_settings.get("DISCORD_WEBHOOK_URL", ""),
             type="password",
             key="discord_webhook_input"
         )
 
         telegram_bot_token = st.text_input(
             "Telegram Bot Token",
-            value=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
+            value=current_settings.get("TELEGRAM_BOT_TOKEN", ""),
             type="password",
             key="telegram_bot_token_input"
         )
 
         telegram_chat_id = st.text_input(
             "Telegram Chat ID",
-            value=os.environ.get("TELEGRAM_CHAT_ID", ""),
+            value=current_settings.get("TELEGRAM_CHAT_ID", ""),
             key="telegram_chat_id_input"
         )
 
         whatsapp_to = st.text_input(
             "WhatsApp To Number",
-            value=os.environ.get("WHATSAPP_TO", ""),
+            value=current_settings.get("WHATSAPP_TO", ""),
             key="whatsapp_to_input"
         )
-
-        if st.button("💾 Save Notification Settings", type="primary"):
-            success_count = 0
-            if discord_webhook:
-                if update_env_variable("DISCORD_WEBHOOK_URL", discord_webhook):
-                    success_count += 1
-            if telegram_bot_token:
-                if update_env_variable("TELEGRAM_BOT_TOKEN", telegram_bot_token):
-                    success_count += 1
-            if telegram_chat_id:
-                if update_env_variable("TELEGRAM_CHAT_ID", telegram_chat_id):
-                    success_count += 1
-            if whatsapp_to:
-                if update_env_variable("WHATSAPP_TO", whatsapp_to):
-                    success_count += 1
-
-            if success_count > 0:
-                st.success(f"✅ {success_count} notification setting(s) saved successfully!")
-            else:
-                st.warning("No notification settings to save")
-
 
 with tab5:
     st.markdown("### 🔧 System Configuration")
@@ -434,7 +550,7 @@ with tab5:
         }
 
         for key, value in status_data.items():
-            st.write(f"**{key}:** {value}")
+            st.markdown(f"**{key}:** {value}")
 
 # Save settings
 st.divider()
@@ -466,14 +582,35 @@ with col1:
                 "NOTIFICATION_ENABLED": notification_enabled,
                 "ML_ENABLED": ml_enabled,
                 "SYMBOLS": [s.strip().upper() for s in symbols_text.split('\n') if s.strip()],
-                "EXCHANGE": current_exchange
+                "EXCHANGE": current_exchange,
+                "DISCORD_WEBHOOK_URL": discord_webhook,
+                "TELEGRAM_BOT_TOKEN": telegram_bot_token,
+                "TELEGRAM_CHAT_ID": telegram_chat_id,
+                "WHATSAPP_TO": whatsapp_to
             }
 
-            success = save_settings(new_settings)
+            success = save_settings(new_settings, user_id=user_id)
 
             if success:
+                # Update virtual balance in WalletBalance if changed
+                if virtual_balance != current_settings.get("VIRTUAL_BALANCE", 100.0):
+                    try:
+                        with db_manager.get_session() as session:
+                            wallet = session.query(WalletBalance).filter_by(
+                                user_id=user_id,
+                                account_type="virtual",
+                                exchange=current_exchange
+                            ).first()
+                            if wallet:
+                                wallet.available = virtual_balance
+                                wallet.total = virtual_balance
+                                session.commit()
+                    except Exception as e:
+                        logger.error(f"Error updating virtual balance: {e}")
+                        st.error(f"Error updating virtual balance: {e}")
+
                 st.success("✅ Settings saved successfully!")
-                trading_engine.reload_settings()  # Assuming the engine has a reload method; if not, remove or implement
+                trading_engine.reload_settings()  # Assuming the engine has a reload method
                 st.balloons()
             else:
                 st.error("❌ Failed to save settings")
@@ -483,41 +620,56 @@ with col1:
 
 with col2:
     if st.button("🔄 Reset to Defaults", use_container_width=True):
-        # Implement reset logic
         default_settings = {
             "SCAN_INTERVAL": 3600,
             "TOP_N_SIGNALS": 5,
-            "MAX_LOSS_PCT": -15.0,
-            "TP_PERCENT": 0.15,
-            "SL_PERCENT": 0.05,
-            "MAX_DRAWDOWN_PCT": -15.0,
-            "LEVERAGE": 10,
-            "RISK_PCT": 0.01,
-            "VIRTUAL_BALANCE": 100.0,
-            "ENTRY_BUFFER_PCT": 0.002,
-            "SYMBOLS": ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "AVAXUSDT"],
-            "USE_WEBSOCKET": True,
-            "MAX_OPEN_POSITIONS": 5,
             "MIN_SIGNAL_SCORE": 60,
-            "EXCHANGE": "binance",
             "AUTO_TRADING_ENABLED": False,
-            "NOTIFICATION_ENABLED": True,
+            "VIRTUAL_BALANCE": 100.0,
             "RSI_OVERSOLD": 30,
             "RSI_OVERBOUGHT": 70,
             "MIN_VOLUME": 1000000,
             "MIN_ATR_PCT": 0.5,
             "MAX_SPREAD_PCT": 0.1,
-            "ML_ENABLED": True,
-            "ML_RETRAIN_THRESHOLD": 100,
+            "MAX_OPEN_POSITIONS": 5,
             "MAX_POSITION_SIZE": 10000.0,
             "MAX_DAILY_LOSS": 1000.0,
-            "MAX_RISK_PER_TRADE": 0.05,
+            "LEVERAGE": 10,
+            "RISK_PCT": 0.01,
+            "TP_PERCENT": 2.0,
+            "SL_PERCENT": 1.5,
+            "NOTIFICATION_ENABLED": True,
+            "ML_ENABLED": True,
+            "SYMBOLS": ["BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT", "AVAXUSDT"],
+            "EXCHANGE": "binance",
+            "DISCORD_WEBHOOK_URL": "",
+            "TELEGRAM_BOT_TOKEN": "",
+            "TELEGRAM_CHAT_ID": "",
+            "WHATSAPP_TO": ""
         }
-        if save_settings(default_settings):
-            st.success("Settings reset to defaults!")
-            st.rerun()
-        else:
-            st.error("Failed to reset settings")
+        try:
+            if save_settings(default_settings, user_id=user_id):
+                try:
+                    with db_manager.get_session() as session:
+                        wallet = session.query(WalletBalance).filter_by(
+                            user_id=user_id,
+                            account_type="virtual",
+                            exchange=current_exchange
+                        ).first()
+                        if wallet:
+                            wallet.available = default_settings["VIRTUAL_BALANCE"]
+                            wallet.total = default_settings["VIRTUAL_BALANCE"]
+                            session.commit()
+                except Exception as e:
+                    logger.error(f"Error resetting virtual balance: {e}")
+                    st.error(f"Error resetting virtual balance: {e}")
+                st.success("Settings reset to defaults!")
+                st.rerun()
+            else:
+                st.error("Failed to reset settings")
+        except Exception as e:
+            logger.error(f"Error resetting settings: {e}")
+            st.error(f"Error: {e}")
 
 with col3:
     if st.button("📤 Export Settings", use_container_width=True):
@@ -538,5 +690,6 @@ st.divider()
 st.markdown(f"""
 **Status:** Exchange: {current_exchange.title()} | 
 Mode: {account_type.title()} | 
+User: {st.session_state.user.get('username', 'N/A')} | 
 Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
 """)
