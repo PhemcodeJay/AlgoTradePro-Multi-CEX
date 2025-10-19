@@ -38,11 +38,22 @@ class RateLimitInfo:
     minute_count: int = 0
 
 class BinanceClient:
-    def __init__(self):
-        """Initialize Binance client"""
+    def __init__(self, user_id: Optional[int] = None):
+        """Initialize Binance client with user-specific API keys"""
         try:
-            self.api_key = os.getenv("BINANCE_API_KEY")
-            self.api_secret = os.getenv("BINANCE_API_SECRET")
+            if user_id:
+                from db import db_manager
+                user = db_manager.get_user_by_id(user_id)
+                if not user or not user["binance_api_key"]:
+                    raise APIConnectionException("No Binance API credentials found for user")
+                self.api_key = user["binance_api_key"]
+                self.api_secret = user["binance_api_secret"]
+            else:
+                self.api_key = os.getenv("BINANCE_API_KEY")
+                self.api_secret = os.getenv("BINANCE_API_SECRET")
+                if not self.api_key or not self.api_secret:
+                    raise APIConnectionException("BINANCE_API_KEY or BINANCE_API_SECRET not set")
+
             self._request_count = 0
             self._last_reset = datetime.now(timezone.utc)
         except Exception as e:
@@ -192,88 +203,83 @@ class BinanceClient:
         else:
             raise APIException(f"API Error (code {error_code}): {error_msg}", error_code=str(error_code), context=create_error_context(module=__name__, function='_handle_api_error', extra_data={'endpoint': endpoint, 'error_code': error_code}))
 
-    def _make_request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        self._validate_api_credentials()
-        if TRADING_MODE != "virtual":
-            self._check_production_rate_limit()
-        else:
-            self._check_rate_limit()
-
-        url = f"{self.base_url}{endpoint}"
-        params = params or {}
-        start_time = time.time()
-        self.total_requests += 1
-        for attempt in range(self.recovery_strategy.max_retries + 1):
-            try:
-                with self._connection_lock:
-                    if not self.session:
-                        raise APIConnectionException("HTTP session not initialized", endpoint=endpoint)
-                    params["timestamp"] = int(time.time() * 1000)
-                    params["signature"] = self._generate_signature(params)
-                    headers = self._get_headers()
-                    if method.upper() == "GET":
-                        response = self.session.get(url, params=params, headers=headers, timeout=(self.connect_timeout, self.request_timeout))
-                    else:
-                        response = self.session.post(url, json=params, headers=headers, timeout=(self.connect_timeout, self.request_timeout))
-                response_time = (time.time() - start_time) * 1000
-                if response.status_code == 429:
-                    retry_after = int(response.headers.get('Retry-After', 60))
-                    raise APIRateLimitException(f"Rate limit exceeded on {endpoint}", retry_after=retry_after, context=create_error_context(module=__name__, function='_make_request', extra_data={'endpoint': endpoint, 'attempt': attempt}))
-                response.raise_for_status()
-                try:
-                    data = response.json()
-                except json.JSONDecodeError as e:
-                    raise APIDataException(f"Invalid JSON response from {endpoint}: {str(e)}", response_data=response.text[:1000], context=create_error_context(module=__name__, function='_make_request', extra_data={'endpoint': endpoint, 'status_code': response.status_code}))
-                if "code" in data and data["code"] != 0:
-                    self._handle_api_error(data, endpoint)
-                self.successful_requests += 1
-                self.last_successful_request = datetime.now()
-                self.consecutive_errors = 0
-                logger.info(f"API request successful: {method} {endpoint}", extra={'endpoint': endpoint, 'method': method, 'response_time_ms': round(response_time, 2), 'status_code': response.status_code, 'attempt': attempt + 1})
-                return data
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                self.failed_requests += 1
-                self.consecutive_errors += 1
-                if not self.recovery_strategy.should_retry(e, attempt):
-                    raise APITimeoutException(f"Request timeout for {endpoint} after {attempt + 1} attempts: {str(e)}", timeout_duration=self.request_timeout, context=create_error_context(module=__name__, function='_make_request', extra_data={'endpoint': endpoint, 'total_attempts': attempt + 1}), original_exception=e)
-                if attempt < self.recovery_strategy.max_retries:
-                    retry_delay = self.recovery_strategy.get_delay(attempt)
-                    logger.warning(f"API request failed (attempt {attempt + 1}), retrying in {retry_delay}s: {str(e)}", extra={'endpoint': endpoint, 'attempt': attempt + 1, 'retry_delay': retry_delay})
-                    time.sleep(retry_delay)
-            except requests.exceptions.HTTPError as e:
-                self.failed_requests += 1
-                self.consecutive_errors += 1
-                status_code = e.response.status_code if e.response else None
-                if status_code == 401:
-                    raise APIAuthenticationException(f"Authentication failed for {endpoint}: {str(e)}", context=create_error_context(module=__name__, function='_make_request', extra_data={'endpoint': endpoint, 'status_code': status_code}), original_exception=e)
-                elif status_code == 403:
-                    raise APIAuthenticationException(f"Access forbidden for {endpoint}: {str(e)}", context=create_error_context(module=__name__, function='_make_request', extra_data={'endpoint': endpoint, 'status_code': status_code}), original_exception=e)
-                else:
-                    raise APIConnectionException(f"HTTP error for {endpoint}: {str(e)}", endpoint=endpoint, status_code=status_code, context=create_error_context(module=__name__, function='_make_request', extra_data={'endpoint': endpoint, 'status_code': status_code}), original_exception=e)
-            except Exception as e:
-                self.failed_requests += 1
-                self.consecutive_errors += 1
-                logger.error(f"Unexpected error in API request to {endpoint}: {str(e)}", extra={'endpoint': endpoint, 'attempt': attempt + 1})
-                raise APIException(f"Unexpected error for {endpoint}: {str(e)}", context=create_error_context(module=__name__, function='_make_request', extra_data={'endpoint': endpoint, 'attempt': attempt + 1}), original_exception=e)
-        raise APIException(f"Maximum retry attempts exceeded for {endpoint}", context=create_error_context(module=__name__, function='_make_request', extra_data={'endpoint': endpoint, 'max_retries': self.recovery_strategy.max_retries}))
-
-    async def _make_request_async(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        return await asyncio.to_thread(self._make_request, method, endpoint, params)
-
-    def _test_connection(self) -> bool:
+    def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None) -> Optional[Dict]:
         try:
-            url = f"{self.base_url}/api/v3/ping"
-            response = requests.get(url, timeout=5)
+            self.total_requests += 1
+            with self.rate_limit_lock:
+                current_time = time.time()
+                if current_time - self.rate_limit.last_request_time < 1.0 / self.rate_limit.requests_per_second:
+                    time.sleep(1.0 / self.rate_limit.requests_per_second)
+                if current_time - self.rate_limit.minute_start >= 60:
+                    self.rate_limit.minute_count = 0
+                    self.rate_limit.minute_start = current_time
+                if self.rate_limit.minute_count >= self.rate_limit.requests_per_minute:
+                    sleep_time = 60 - (current_time - self.rate_limit.minute_start)
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    self.rate_limit.minute_count = 0
+                    self.rate_limit.minute_start = time.time()
+                self.rate_limit.minute_count += 1
+                self.rate_limit.last_request_time = time.time()
+
+            url = f"{self.base_url}{endpoint}"
+            headers = {'X-MBX-APIKEY': self.api_key}
+            timestamp = str(int(time.time() * 1000))
+            if params is None:
+                params = {}
+            params['timestamp'] = timestamp
+            query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+            signature = hmac.new(
+                self.api_secret.encode('utf-8'),
+                query_string.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            params['signature'] = signature
+
+            response = self.session.request(
+                method,
+                url,
+                params=params,
+                headers=headers,
+                timeout=(self.connect_timeout, self.request_timeout)
+            )
             response.raise_for_status()
-            if response.json() == {}:
-                self._connected = True
-                logger.info("API connection test successful")
-                return True
-            return False
+            result = response.json()
+            self.successful_requests += 1
+            self.last_successful_request = datetime.now(timezone.utc)
+            self.consecutive_errors = 0
+            return result
+
+        except requests.exceptions.RequestException as e:
+            self.failed_requests += 1
+            logger.error(f"API request failed for {endpoint}: {str(e)}", exc_info=True)
+            if isinstance(e, requests.exceptions.HTTPError):
+                if e.response.status_code == 429:
+                    raise APIRateLimitException("Rate limit exceeded", endpoint=endpoint)
+                elif e.response.status_code in [401, 403]:
+                    raise APIAuthenticationException("Authentication error", endpoint=endpoint)
+                elif e.response.status_code == 504:
+                    raise APITimeoutException("Request timeout", endpoint=endpoint)
+            raise APIConnectionException(f"Request failed: {str(e)}", endpoint=endpoint, original_exception=e)
+
+    def _test_connection(self):
+        try:
+            self._make_request("GET", "/api/v3/ping")
+            self._connected = True
+            logger.info("Binance connection test successful")
         except Exception as e:
-            logger.error(f"Connection test failed: {e}")
+            logger.error(f"Binance connection test failed: {e}")
             self._connected = False
-            return False
+            raise APIConnectionException(f"Connection test failed: {str(e)}")
+
+    def get_connection_health(self) -> Dict[str, Any]:
+        return {
+            'status': 'healthy' if self._connected else 'unhealthy',
+            'last_successful_request': self.last_successful_request,
+            'total_requests': self.total_requests,
+            'successful_requests': self.successful_requests,
+            'failed_requests': self.failed_requests
+        }
 
     def is_connected(self) -> bool:
         if not self._connected:
@@ -387,6 +393,20 @@ class BinanceClient:
             base_price = close_price
         logger.debug(f"Generated {len(klines)} simulated klines for {symbol}")
         return klines
+    
+    def get_balance(self) -> Dict[str, float]:
+        try:
+            result = self._make_request("GET", "/fapi/v2/balance")
+            for asset in result:
+                if asset['asset'] == 'USDT':
+                    return {
+                        'available': float(asset['availableBalance']),
+                        'total': float(asset['balance'])
+                    }
+            return {'available': 0.0, 'total': 0.0}
+        except Exception as e:
+            logger.error(f"Error fetching balance: {e}")
+            return {'available': 0.0, 'total': 0.0}
 
     async def place_order(
         self,

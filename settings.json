@@ -58,5 +58,6 @@
     "NOTIFICATION_ENABLED": false,
     "ML_ENABLED": true,
     "ML_RETRAIN_THRESHOLD": 200.0
-  }
+  },
+  "TRADING_MODE": "real"
 }

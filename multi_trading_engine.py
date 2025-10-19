@@ -5,7 +5,7 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
-from db import db_manager, Trade, WalletBalance
+from db import db_manager, Trade, WalletBalance, Signal
 from settings import load_settings
 from logging_config import get_trading_logger
 from exceptions import TradingException, create_error_context, APIException, APIRateLimitException, APIAuthenticationException, APITimeoutException
@@ -100,6 +100,9 @@ class TradingEngine:
             self.successful_trades = 0
             self.failed_trades = 0
 
+            # Initialize wallet balances if they don't exist
+            self._initialize_wallet_balances()
+
             logger.info(
                 f"Trading engine initialized for {self.exchange_name}",
                 extra={
@@ -118,6 +121,25 @@ class TradingEngine:
             )
             logger.error(f"Failed to initialize trading engine: {str(e)}", extra=error_context)
             raise TradingException(f"Failed to initialize trading engine: {str(e)}", context=error_context)
+
+    def _initialize_wallet_balances(self):
+        """Initialize wallet balances for both virtual and real accounts"""
+        try:
+            # Check and initialize virtual balance
+            virtual_balance = self.db.get_wallet_balance("virtual", self.exchange_name)
+            if not virtual_balance:
+                initial_virtual = to_float(self.settings.get("VIRTUAL_BALANCE", 10000.0))
+                self.db.update_wallet_balance("virtual", initial_virtual, 0.0, self.exchange_name)
+                logger.info(f"Initialized virtual wallet balance: ${initial_virtual}")
+
+            # Check and initialize real balance (if API keys exist)
+            real_balance = self.db.get_wallet_balance("real", self.exchange_name)
+            if not real_balance:
+                self.db.update_wallet_balance("real", 0.0, 0.0, self.exchange_name)
+                logger.info("Initialized real wallet balance: $0.00")
+
+        except Exception as e:
+            logger.error(f"Error initializing wallet balances: {e}")
 
     def switch_exchange(self, exchange: str) -> bool:
         """Switch the trading engine to a different exchange"""
@@ -144,6 +166,9 @@ class TradingEngine:
             elif exchange == "bybit":
                 from bybit_client import BybitClient
                 self.client = BybitClient()
+
+            # Reinitialize wallet balances for new exchange
+            self._initialize_wallet_balances()
 
             logger.info(f"Switched to {exchange} exchange")
             return True
@@ -219,7 +244,8 @@ class TradingEngine:
         try:
             if is_true(self._emergency_stop):
                 return False
-            # some clients may provide method is_connected; check carefully
+            
+            # Check client connectivity
             try:
                 client_connected = getattr(self.client, "is_connected", None)
                 if callable(client_connected):
@@ -227,19 +253,19 @@ class TradingEngine:
                         logger.warning("Client not connected, trading disabled")
                         return False
                 else:
-                    # If there's an attribute `.connected` (bool-like), check it safely
                     connected_attr = getattr(self.client, "connected", None)
                     if not is_true(connected_attr):
                         logger.warning("Client not connected (attribute check), trading disabled")
                         return False
             except Exception:
-                # If any error evaluating connectivity, default to disabled (safer)
                 logger.warning("Unable to determine client connectivity; treating as not connected")
                 return False
 
+            # Check daily loss limit
             if to_float(self._daily_pnl) <= -to_float(self.max_daily_loss):
                 logger.warning(f"Daily loss limit reached: {self._daily_pnl}")
                 return False
+            
             return bool(self._trading_enabled)
         except Exception as e:
             logger.error(f"Error checking trading status: {e}")
@@ -309,7 +335,7 @@ class TradingEngine:
             if len(open_positions) >= int(self.max_open_positions):
                 logger.warning(f"Max open positions reached: {len(open_positions)}")
                 return False
-            # defensively compute numeric values
+            
             total_position_value = 0.0
             for p in open_positions:
                 size = to_float(p.get("size", 0))
@@ -325,6 +351,7 @@ class TradingEngine:
 
     async def execute_trade(self, signal: Dict[str, Any]) -> bool:
         """Execute a trade based on signal with enhanced robustness"""
+        trade = None
         try:
             symbol = signal.get("symbol", '').replace('/', '')
             side = signal.get("side", "BUY").lower()
@@ -344,19 +371,14 @@ class TradingEngine:
                 logger.error(f"Invalid trade parameters: price={entry_price}, qty={qty}")
                 return False
 
-            if TRADING_MODE == "virtual":
-                # If virtual mode, update capital and execute virtual trade
-                self._update_capital_json("virtual", qty * entry_price)
-                return self.execute_virtual_trade(signal)
-
-            # Create trade entry in database
+            # Create trade entry in database first
             trade = Trade(
                 symbol=symbol,
                 side=side,
                 qty=qty,
                 entry_price=entry_price,
                 status="pending",
-                virtual=False,
+                virtual=TRADING_MODE == "virtual",
                 leverage=leverage,
                 sl=stop_loss,
                 tp=take_profit,
@@ -366,12 +388,27 @@ class TradingEngine:
                 signal_id=signal.get("id"),
                 indicators=indicators
             )
-            self.db.add_trade(trade)
-            self.db.session.commit()
+            
+            if not self.db.add_trade(trade):
+                logger.error(f"Failed to create trade record for {symbol}")
+                return False
 
-            # Update capital for real trades
-            self._update_capital_json("real", qty * entry_price)
+            # Update wallet balance for position
+            trade_value = qty * entry_price
+            if TRADING_MODE == "virtual":
+                self._update_wallet_balance("virtual", -trade_value, "used", trade_value)
+            else:
+                self._update_wallet_balance("real", -trade_value, "used", trade_value)
 
+            if TRADING_MODE == "virtual":
+                # Update trade status to open for virtual trades
+                self.db.update_trade(trade.id, {"status": "open"})
+                self.trade_count += 1
+                self.successful_trades += 1
+                logger.info(f"Virtual trade executed: {symbol} {side} {qty} @ {entry_price}")
+                return True
+
+            # Execute real trade
             max_retries = 3
             for attempt in range(max_retries):
                 try:
@@ -391,37 +428,27 @@ class TradingEngine:
                         if "error" not in order and order.get("status", "").lower() in ["new", "filled"]:
                             order_id = str(order.get("order_id", ""))
                             status = order.get("status", "pending").lower()
-                            self.db.update_trade(int(trade.id), {"order_id": order_id, "status": status})  # type: ignore
-                            self.db.session.commit()
+                            self.db.update_trade(trade.id, {"order_id": order_id, "status": status})
                             self.trade_count += 1
                             self.successful_trades += 1
-                            logger.info(f"Trade executed: {symbol} {side} {qty} @ {entry_price}, order_id={order_id}")
+                            logger.info(f"Real trade executed: {symbol} {side} {qty} @ {entry_price}, order_id={order_id}")
                             return True
                         else:
                             error_msg = order.get("error", "Unknown error")
-                            logger.error(f"Trade execution failed for {symbol}: {error_msg}")
-                            self.trade_count += 1
-                            self.failed_trades += 1
-                            self.db.update_trade(int(trade.id), {"status": "failed", "error": error_msg})  # type: ignore
-                            self.db.session.commit()
+                            self._handle_trade_failure(trade.id, error_msg)
                             return False
                     elif self.exchange_name == "bybit":
                         if to_float(order.get("retCode", -1)) == 0:
                             order_id = order.get("result", {}).get("orderId", "")
                             status = "filled" if order.get("result", {}).get("orderStatus", "") == "Filled" else "pending"
-                            self.db.update_trade(int(trade.id), {"order_id": order_id, "status": status})  # type: ignore
-                            self.db.session.commit()
+                            self.db.update_trade(trade.id, {"order_id": order_id, "status": status})
                             self.trade_count += 1
                             self.successful_trades += 1
-                            logger.info(f"Trade executed: {symbol} {side} {qty} @ {entry_price}, order_id={order_id}")
+                            logger.info(f"Real trade executed: {symbol} {side} {qty} @ {entry_price}, order_id={order_id}")
                             return True
                         else:
                             error_msg = order.get("retMsg", "Unknown error")
-                            logger.error(f"Trade execution failed for {symbol}: {error_msg}")
-                            self.trade_count += 1
-                            self.failed_trades += 1
-                            self.db.update_trade(int(trade.id), {"status": "failed", "error": error_msg})  # type: ignore
-                            self.db.session.commit()
+                            self._handle_trade_failure(trade.id, error_msg)
                             return False
 
                 except (APIException, APIRateLimitException, APIAuthenticationException, APITimeoutException) as e:
@@ -432,81 +459,70 @@ class TradingEngine:
                         await asyncio.sleep(retry_delay)
                         continue
                     else:
-                        self.trade_count += 1
-                        self.failed_trades += 1
-                        # best-effort update
-                        try:
-                            self.db.update_trade(int(trade.id), {"status": "failed", "error": str(e)})  # type: ignore
-                            self.db.session.commit()
-                        except Exception:
-                            pass
-                        logger.error(f"Max retries exceeded for {symbol}: {str(e)}")
+                        self._handle_trade_failure(trade.id, str(e))
                         return False
                 except Exception as e:
-                    self.trade_count += 1
-                    self.failed_trades += 1
-                    try:
-                        self.db.update_trade(int(trade.id), {"status": "failed", "error": str(e)})  # type: ignore
-                        self.db.session.commit()
-                    except Exception:
-                        pass
-                    logger.error(f"Unexpected error executing trade for {symbol}: {e}")
+                    self._handle_trade_failure(trade.id, str(e))
                     return False
 
         except Exception as e:
+            logger.error(f"Error executing trade for {symbol}: {e}")
+            if trade:
+                self._handle_trade_failure(trade.id, str(e))
+            return False
+
+    def _handle_trade_failure(self, trade_id: int, error_msg: str):
+        """Handle trade failure and update records"""
+        try:
+            self.db.update_trade(trade_id, {"status": "failed", "error_message": error_msg})
             self.trade_count += 1
             self.failed_trades += 1
-            if 'trade' in locals():
-                try:
-                    self.db.update_trade(int(trade.id), {"status": "failed", "error": str(e)})  # type: ignore
-                    self.db.session.commit()
-                except Exception:
-                    pass
-            logger.error(f"Error executing trade for {symbol}: {e}")
-            return False
-        finally:
-            try:
-                self.db.session.close()
-            except Exception:
-                pass
-
-        # Ensure a boolean return in all code paths (static analyzers want this)
-        return False
+            
+            # Revert wallet balance changes
+            trade = self.db.get_trade_by_id(trade_id)
+            if trade:
+                trade_value = to_float(trade.qty) * to_float(trade.entry_price)
+                account_type = "virtual" if trade.virtual else "real"
+                self._update_wallet_balance(account_type, trade_value, "available", -trade_value)
+                
+        except Exception as e:
+            logger.error(f"Error handling trade failure for trade {trade_id}: {e}")
 
     def get_account_balance(self) -> Dict[str, Any]:
-        """Get account balance"""
+        """Get account balance from database"""
         try:
             if TRADING_MODE == "virtual":
-                # This is a simplified representation for virtual mode.
-                # In a real scenario, this would fetch from a virtual balance store.
-                trades = self.db.get_trades(exchange=self.exchange_name, status="open") or []
-                total_pnl = sum(to_float(getattr(t, "pnl", 0)) for t in trades)
-                initial_balance = to_float(self.settings.get("VIRTUAL_BALANCE", 10000.0))
+                wallet = self.db.get_wallet_balance("virtual", self.exchange_name) or WalletBalance(
+                    account_type="virtual", available=10000.0, used=0.0, total=10000.0, currency="USDT", exchange=self.exchange_name
+                )
+            else:
+                wallet = self.db.get_wallet_balance("real", self.exchange_name)
+                if not wallet:
+                    # Try to fetch from exchange if no record exists
+                    try:
+                        balance_data = self.client.get_account_balance() or {}
+                        usdt_balance = to_float(balance_data.get("USDT", {}).get("free", 0))
+                        self.db.update_wallet_balance("real", usdt_balance, 0.0, self.exchange_name)
+                        wallet = self.db.get_wallet_balance("real", self.exchange_name)
+                    except Exception:
+                        wallet = WalletBalance(account_type="real", available=0.0, used=0.0, total=0.0, currency="USDT", exchange=self.exchange_name)
+
+            if wallet:
                 return {
                     "USDT": {
-                        "total": initial_balance + total_pnl,
-                        "free": initial_balance + total_pnl,
-                        "used": 0,
-                        "currency": "USDT"
+                        "total": to_float(wallet.total),
+                        "free": to_float(wallet.available),
+                        "used": to_float(wallet.used),
+                        "currency": wallet.currency
                     }
                 }
-            balance = self.client.get_account_balance() or {}
-            formatted_balance = {
-                currency: {
-                    "total": to_float(getattr(b, "total", 0)),
-                    "free": to_float(getattr(b, "available", getattr(b, "free", 0))),
-                    "used": to_float(getattr(b, "used", 0)),
-                    "currency": currency
-                } for currency, b in (balance.items() if isinstance(balance, dict) else [])
-            }
-            return formatted_balance
+            return {'USDT': {'total': 0.0, 'free': 0.0, 'used': 0.0, 'currency': 'USDT'}}
         except Exception as e:
-            logger.error(f"Error fetching real account balance: {e}")
+            logger.error(f"Error fetching account balance: {e}")
             return {'USDT': {'total': 0.0, 'free': 0.0, 'used': 0.0, 'currency': 'USDT'}}
 
     def execute_virtual_trade(self, signal: Dict[str, Any]) -> bool:
         """Execute a virtual trade based on signal"""
-        success = False
         try:
             symbol = signal.get("symbol", '').replace('/', '')
             side = signal.get("side", "BUY")
@@ -540,6 +556,9 @@ class TradingEngine:
             # Add to database
             success = bool(self.db.add_trade(trade))
             if success:
+                # Update wallet balance
+                trade_value = qty * entry_price
+                self._update_wallet_balance("virtual", -trade_value, "used", trade_value)
                 logger.info(f"Virtual trade executed: {symbol} {side} {qty} @ {entry_price}")
 
             return success
@@ -562,18 +581,23 @@ class TradingEngine:
                 "entry_price": getattr(trade, "entry_price", 0),
                 "qty": getattr(trade, "qty", 0),
                 "side": getattr(trade, "side", "BUY")
-            }, exit_price) # Pass exit_price here
+            }, exit_price)
+
+            # Revert used balance and add PnL to available
+            trade_value = to_float(trade.qty) * to_float(trade.entry_price)
+            self._update_wallet_balance("virtual", trade_value, "available", -trade_value + pnl)
 
             # Update trade
             updates = {
                 "status": "closed",
                 "exit_price": exit_price,
-                "pnl": pnl
+                "pnl": pnl,
+                "updated_at": datetime.now(timezone.utc)
             }
 
             success = bool(self.db.update_trade(trade_id, updates))
             if success:
-                logger.info(f"Virtual trade closed: {trade.symbol} PnL: {pnl}")
+                logger.info(f"Virtual trade closed: {trade.symbol} PnL: ${pnl:.2f}")
 
             return success
 
@@ -603,48 +627,31 @@ class TradingEngine:
             logger.error(f"Error calculating virtual PnL for {trade.get('symbol')}: {e}")
             return 0.0
 
-    def _update_capital_json(self, account_type: str, amount: float):
-        """Update capital.json file with trade amounts"""
+    def _update_wallet_balance(self, account_type: str, available_delta: float, used_delta: float = 0.0, total_delta: float = 0.0):
+        """Update wallet balance in database"""
         try:
-            import json
-            capital_file = "capital.json"
-
-            # Load existing capital data
-            if os.path.exists(capital_file):
-                with open(capital_file, 'r') as f:
-                    capital_data = json.load(f)
-            else:
-                # Default structure if capital.json doesn't exist
-                capital_data = {
-                    "real": {"capital": 0.0, "available": 0.0, "used": 0.0, "start_balance": 0.0, "currency": "USDT"},
-                    "virtual": {"capital": 100.0, "available": 100.0, "used": 0.0, "start_balance": 100.0, "currency": "USDT"}
-                }
-
-            # Update the appropriate account
-            if account_type in capital_data:
-                # For trades, 'amount' typically represents the value of the position being opened.
-                # We add this to 'used' and subtract from 'available'.
-                capital_data[account_type]["used"] = to_float(capital_data[account_type]["used"]) + abs(amount)
-                capital_data[account_type]["available"] = to_float(capital_data[account_type]["available"]) - abs(amount)
+            wallet = self.db.get_wallet_balance(account_type, self.exchange_name)
+            if wallet:
+                new_available = to_float(wallet.available) + available_delta
+                new_used = to_float(wallet.used) + used_delta
+                new_total = to_float(wallet.total) + total_delta
                 
-                # Ensure available and used don't go below zero due to floating point inaccuracies or order of operations
-                capital_data[account_type]["available"] = max(0.0, capital_data[account_type]["available"])
-                capital_data[account_type]["used"] = max(0.0, capital_data[account_type]["used"])
-
-                # Save back to file
-                with open(capital_file, 'w') as f:
-                    json.dump(capital_data, f, indent=4)
-
-                # Also update database wallet balance
+                # Ensure balances don't go negative
+                new_available = max(0.0, new_available)
+                new_used = max(0.0, new_used)
+                
                 self.db.update_wallet_balance(
                     account_type,
-                    available=capital_data[account_type]["available"],
-                    used=capital_data[account_type]["used"],
+                    available=new_available,
+                    used=new_used,
                     exchange=self.exchange_name
                 )
-
-                logger.info(f"Updated {account_type} capital: available={capital_data[account_type]['available']}, used={capital_data[account_type]['used']}")
+                logger.debug(f"Updated {account_type} wallet: available=${new_available:.2f}, used=${new_used:.2f}")
             else:
-                logger.error(f"Account type '{account_type}' not found in capital data.")
+                logger.error(f"Wallet balance not found for {account_type}")
         except Exception as e:
-            logger.error(f"Error updating capital.json: {e}")
+            logger.error(f"Error updating wallet balance for {account_type}: {e}")
+
+    def get_max_open_positions(self) -> int:
+        """Get maximum open positions setting"""
+        return self.max_open_positions

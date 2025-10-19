@@ -9,17 +9,16 @@ if TYPE_CHECKING:
 
 # Custom LogRecord to support extra_data
 class CustomLogRecord(logging.LogRecord):
-    extra_data: Optional[Dict[str, Any]]
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.extra_data = kwargs.get('extra', {}).get('extra_data')
+    def __init__(self, name, level, pathname, lineno, msg, args, exc_info, func=None, sinfo=None, **kwargs):
+        super().__init__(name, level, pathname, lineno, msg, args, exc_info, func, sinfo)
+        # Safely initialize extra_data
+        self.extra_data = kwargs.get('extra', {}).get('extra_data', None)
 
 # Configure logging format
 class StructuredFormatter(logging.Formatter):
     """Custom formatter for structured JSON logging"""
     
-    def format(self, record: CustomLogRecord) -> str:
+    def format(self, record: 'CustomLogRecord') -> str:
         log_data = {
             'timestamp': datetime.utcnow().isoformat(),
             'level': record.levelname,
@@ -31,7 +30,7 @@ class StructuredFormatter(logging.Formatter):
         }
         
         # Add extra fields if present
-        if hasattr(record, 'extra_data') and record.extra_data:
+        if hasattr(record, 'extra_data') and record.extra_data is not None:
             log_data.update(record.extra_data)
         
         return json.dumps(log_data)
@@ -78,9 +77,7 @@ def get_logger(name: str, level: int = logging.INFO, structured_format: bool = F
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     
-    # Set custom LogRecord factory
-    logging.setLogRecordFactory(CustomLogRecord)
-    
+    # Set custom LogRecord factory only once at module level
     return logger
 
 def get_trading_logger(name: str) -> logging.Logger:
@@ -130,6 +127,10 @@ def log_ml_event(logger: logging.Logger, event: str, model_type: str, data: Dict
             }
         }
     )
+
+# Set custom LogRecord factory once at module level
+if logging.getLogRecordFactory() != CustomLogRecord:
+    logging.setLogRecordFactory(CustomLogRecord)
 
 # Default logger for the application
 default_logger = get_logger('algotrader')

@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import time
 from typing import List, Dict, Any, Optional
+from exceptions import APIConnectionException, APIDataException
 from logging_config import get_trading_logger
 from binance_client import BinanceClient
 from bybit_client import BybitClient
@@ -11,16 +12,109 @@ logger = get_trading_logger(__name__)
 
 _client_cache = {}
 def get_client(exchange: str) -> Any:
-    """Get or reuse the appropriate client based on exchange"""
-    exchange = exchange.lower()
-    if exchange not in _client_cache:
-        if exchange == "binance":
-            _client_cache[exchange] = BinanceClient()
-        elif exchange == "bybit":
-            _client_cache[exchange] = BybitClient()
+    """Get exchange client based on name"""
+    try:
+        if exchange.lower() == "binance":
+            return BinanceClient()
+        elif exchange.lower() == "bybit":
+            return BybitClient()
         else:
             raise ValueError(f"Unsupported exchange: {exchange}")
-    return _client_cache[exchange]
+    except Exception as e:
+        logger.error(f"Error initializing client for {exchange}: {e}")
+        raise APIConnectionException(f"Failed to initialize client for {exchange}: {str(e)}")
+
+def get_top_symbols(exchange: str, limit: int = 50) -> List[str]:
+    """Get top USDT trading pairs by 24h volume using custom client"""
+    client = get_client(exchange)
+    try:
+        tickers = {}
+        if exchange == "binance":
+            raw_tickers = client.exchange.fetch_tickers()
+            for symbol, data in raw_tickers.items():
+                if symbol.endswith('/USDT'):
+                    normalized_symbol = symbol.replace('/', '')
+                    tickers[normalized_symbol] = {
+                        'quoteVolume': float(data.get('quoteVolume', 0))
+                    }
+        elif exchange == "bybit":
+            result = client._make_request("GET", "/v5/market/tickers", {"category": "linear"})
+            if result and "result" in result and "list" in result["result"]:
+                for item in result["result"]["list"]:
+                    symbol = item["symbol"]
+                    if symbol.endswith("USDT"):
+                        tickers[symbol] = {
+                            'quoteVolume': float(item.get("turnover24h", 0))
+                        }
+            else:
+                raise ValueError("Invalid response from Bybit tickers API")
+        else:
+            raise ValueError(f"Unsupported exchange: {exchange}")
+
+        if not tickers:
+            raise ValueError("No USDT tickers found")
+
+        sorted_symbols = sorted(
+            tickers.keys(),
+            key=lambda s: tickers[s]['quoteVolume'],
+            reverse=True
+        )
+        top_symbols = sorted_symbols[:limit]
+        logger.info(f"Fetched {len(top_symbols)} real USDT symbols for {exchange} by 24h volume")
+        return top_symbols
+
+    except Exception as e:
+        logger.error(f"Error fetching real top symbols for {exchange}: {e}")
+        fallback_symbols = [
+            "BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT",
+            "BNBUSDT", "AVAXUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT",
+            "MATICUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "XLMUSDT",
+            "TRXUSDT", "VETUSDT", "ALGOUSDT"
+        ]
+        symbols = list(dict.fromkeys(fallback_symbols))[:limit]
+        logger.warning(f"Using fallback {len(symbols)} USDT symbols for {exchange}")
+        return symbols
+
+def fetch_klines(exchange: str, symbol: str, timeframe: str = '1h', limit: int = 200) -> Optional[pd.DataFrame]:
+    """Fetch kline data from exchange"""
+    client = get_client(exchange)
+    try:
+        if exchange == "binance":
+            klines = client.exchange.fetch_ohlcv(symbol.replace('USDT', '/USDT'), timeframe, limit=limit)
+        elif exchange == "bybit":
+            result = client._make_request("GET", "/v5/market/kline", {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": timeframe,
+                "limit": limit
+            })
+            if result and "result" in result and "list" in result["result"]:
+                klines = [[
+                    int(item[0]),
+                    float(item[1]),
+                    float(item[2]),
+                    float(item[3]),
+                    float(item[4]),
+                    float(item[5])
+                ] for item in result["result"]["list"]]
+            else:
+                raise APIDataException("Invalid kline response from Bybit")
+        else:
+            raise ValueError(f"Unsupported exchange: {exchange}")
+
+        df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        
+        if df.empty or len(df) < limit:
+            logger.warning(f"Insufficient kline data for {symbol} on {exchange}")
+            return None
+            
+        return df
+
+    except Exception as e:
+        logger.error(f"Error fetching klines for {symbol} on {exchange}: {e}")
+        return None
 
 # Utility function to convert np.float64 to float recursively
 def convert_np_types(data: Any) -> Any:
@@ -32,67 +126,17 @@ def convert_np_types(data: Any) -> Any:
         return float(data)
     return data
 
-def get_top_symbols(exchange: str, limit: int = 50) -> List[str]:
-    """Get top USDT trading pairs by volume using custom client"""
-    fallback_symbols = [
-        "BTCUSDT", "ETHUSDT", "DOGEUSDT", "SOLUSDT", "XRPUSDT",
-        "BNBUSDT", "AVAXUSDT", "ADAUSDT", "DOTUSDT", "LINKUSDT",
-        "MATICUSDT", "SHIBUSDT", "LTCUSDT", "BCHUSDT", "XLMUSDT",
-        "TRXUSDT", "VETUSDT", "ALGOUSDT"
-    ]
-    symbols = list(dict.fromkeys(fallback_symbols))[:limit]
-    logger.info(f"Using predefined {len(symbols)} USDT symbols for {exchange}")
-    return symbols
-
-def fetch_klines(exchange: str, symbol: str, timeframe: str = '1h', limit: int = 500) -> Optional[pd.DataFrame]:
-    """Fetch klines/candles for a symbol using custom client"""
+def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate technical indicators"""
     try:
-        client = get_client(exchange)
-        timeframe_map = {
-            '1h': '60', '4h': '240', '1d': '1440',
-            '60': '60', '240': '240', '1440': '1440'
-        }
-        interval = timeframe_map.get(timeframe, '60')
-        
-        klines = client.get_klines(symbol, interval, limit)
-        logger.debug(f"Fetched {len(klines)} klines for {symbol}: {klines[:2] if klines else []}")
-        
-        if not klines:
-            logger.warning(f"No data received for {symbol}")
-            return None
-        
-        df = pd.DataFrame(klines)
-        logger.debug(f"Raw DataFrame for {symbol}: {df.head(2).to_dict()}")
-        
-        required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required_columns):
-            logger.error(f"Missing required columns in klines for {symbol}: {df.columns}")
-            return None
-        
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-        
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        
-        nan_count = df.isna().sum().sum()
-        if nan_count > 0:
-            logger.warning(f"Dropping {nan_count} rows with NaN values for {symbol}")
-            df.dropna(inplace=True)
-        
-        if df.empty:
-            logger.warning(f"DataFrame empty after cleaning for {symbol}")
-            return None
-        
-        logger.info(f"Processed DataFrame for {symbol} with {len(df)} rows")
+        df['sma20'] = df['close'].rolling(window=20).mean()
+        df['sma50'] = df['close'].rolling(window=50).mean()
+        df['rsi'] = calculate_rsi(df['close'], 14)
+        df['atr'] = calculate_atr(df['high'], df['low'], df['close'], 14)
         return df
     except Exception as e:
-        error_msg = str(e)
-        if "403" in error_msg or "Forbidden" in error_msg or "451" in error_msg or "restricted location" in error_msg:
-            logger.warning(f"API access restricted for {symbol}. This may be due to geographical restrictions.")
-        else:
-            logger.error(f"Error fetching klines for {symbol}: {e}")
-        return None
+        logger.error(f"Error calculating indicators: {e}")
+        return df
 
 def calculate_sma(df: pd.DataFrame, period: int = 20) -> pd.Series:
     """Calculate Simple Moving Average"""

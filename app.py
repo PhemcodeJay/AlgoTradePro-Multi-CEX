@@ -6,9 +6,10 @@ import asyncio
 import threading
 import time
 from typing import Dict, Any, List
+import bcrypt
 
 # Import core modules
-from db import db_manager
+from db import db_manager, User, WalletBalance
 from settings import load_settings, validate_env, save_settings
 from logging_config import get_trading_logger
 from multi_trading_engine import TradingEngine
@@ -33,12 +34,78 @@ if 'initialized' not in st.session_state:
     st.session_state.current_exchange = os.getenv("EXCHANGE", "binance").lower()
     st.session_state.trading_active = False
     st.session_state.account_type = 'virtual'  # Default to virtual
+    st.session_state.authenticated = False  # Track authentication state
+    st.session_state.user = None  # Store user info (dict with id, username)
 
 def to_float(value):
     try:
         return float(value or 0)
     except Exception:
         return 0.0
+
+def authenticate_user(username: str, password: str) -> bool:
+    """Authenticate user against the database with hashed password."""
+    try:
+        with db_manager.get_session() as session:
+            user = session.query(User).filter_by(username=username).first()
+            if user and bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
+                st.session_state.user = {'id': user.id, 'username': user.username}
+                return True
+            return False
+    except Exception as e:
+        logger.error(f"Authentication error for {username}: {e}")
+        return False
+
+def register_user(username: str, password: str) -> bool:
+    """Register a new user with hashed password and initialize wallet balances."""
+    try:
+        with db_manager.get_session() as session:
+            # Check if username already exists
+            if session.query(User).filter_by(username=username).first():
+                logger.warning(f"Registration failed: Username {username} already exists")
+                return False
+            
+            # Hash password
+            hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            
+            # Create new user
+            new_user = User(
+                username=username,
+                password_hash=hashed_password,
+                binance_api_key=None,
+                binance_api_secret=None,
+                bybit_api_key=None,
+                bybit_api_secret=None
+            )
+            session.add(new_user)
+            session.commit()
+
+            # Initialize default wallet balances
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="virtual",
+                available=100.0,
+                used=0.0,
+                total=100.0,
+                currency="USDT",
+                exchange=st.session_state.current_exchange
+            ))
+            session.add(WalletBalance(
+                user_id=new_user.id,
+                account_type="real",
+                available=0.0,
+                used=0.0,
+                total=0.0,
+                currency="USDT",
+                exchange=st.session_state.current_exchange
+            ))
+            session.commit()
+            logger.info(f"Registered new user: {username}, ID: {new_user.id}")
+            return True
+    except Exception as e:
+        logger.error(f"Registration error for {username}: {e}")
+        session.rollback()
+        return False
 
 def initialize_app():
     """Initialize the application components"""
@@ -100,9 +167,8 @@ def initialize_app():
         st.session_state.automated_trader = automated_trader
         st.session_state.current_exchange = exchange
         st.session_state.initialized = True
-
+        logger.info(f"App initialized successfully: exchange={exchange}, trading_mode={trading_mode}")
         return True
-
     except Exception as e:
         logger.error(f"Failed to initialize app: {e}")
         st.error(f"Application initialization failed: {str(e)}")
@@ -111,19 +177,30 @@ def initialize_app():
 @st.cache_data
 def get_cached_dashboard_data(exchange: str, account_type: str, _is_virtual: bool) -> Dict[str, Any]:
     """Fetch and cache dashboard data as plain dictionaries"""
-    with db_manager.get_session() as session:
-        try:
+    try:
+        # Ensure user_id is available
+        user_id = st.session_state.user.get('id') if st.session_state.user else None
+        if not user_id:
+            logger.error("No user_id found in session state for dashboard data")
+            return {
+                'signals': [],
+                'wallet': {'available': 0.0},
+                'open_trades': [],
+                'closed_trades': []
+            }
+
+        with db_manager.get_session() as session:
             # Fetch signals
-            signals = db_manager.get_signals(limit=10, exchange=exchange) or []
+            signals = db_manager.get_signals(limit=10, exchange=exchange, user_id=user_id) or []
             signals_data = [s.to_dict() for s in signals]
 
             # Fetch wallet balance
-            wallet = db_manager.get_wallet_balance(account_type=account_type, exchange=exchange)
-            wallet_data = wallet.to_dict() if wallet else {'available': 0.0}
+            wallet = db_manager.get_wallet_balance(account_type=account_type, user_id=user_id, exchange=exchange)
+            wallet_data = wallet.to_dict() if wallet else {'available': 0.0, 'used': 0.0, 'total': 0.0}
 
             # Fetch trades
-            open_trades = db_manager.get_trades(status='open', virtual=_is_virtual, exchange=exchange) or []
-            closed_trades = db_manager.get_trades(status='closed', virtual=_is_virtual, exchange=exchange) or []
+            open_trades = db_manager.get_trades(status='open', virtual=_is_virtual, exchange=exchange, user_id=user_id) or []
+            closed_trades = db_manager.get_trades(status='closed', virtual=_is_virtual, exchange=exchange, user_id=user_id) or []
             open_trades_data = [t.to_dict() for t in open_trades]
             closed_trades_data = [t.to_dict() for t in closed_trades]
 
@@ -133,50 +210,96 @@ def get_cached_dashboard_data(exchange: str, account_type: str, _is_virtual: boo
                 'open_trades': open_trades_data,
                 'closed_trades': closed_trades_data
             }
-        except Exception as e:
-            logger.error(f"Error fetching cached dashboard data: {e}")
-            return {
-                'signals': [],
-                'wallet': {'available': 0.0},
-                'open_trades': [],
-                'closed_trades': []
-            }
+    except Exception as e:
+        logger.error(f"Error fetching cached dashboard data: {e}")
+        return {
+            'signals': [],
+            'wallet': {'available': 0.0},
+            'open_trades': [],
+            'closed_trades': []
+        }
 
 @st.cache_data
 def get_cached_signals(exchange: str, limit: int = 5) -> List[Dict[str, Any]]:
     """Fetch and cache recent signals as plain dictionaries"""
-    with db_manager.get_session() as session:
-        try:
-            signals = db_manager.get_signals(limit=limit, exchange=exchange) or []
-            return [s.to_dict() for s in signals]
-        except Exception as e:
-            logger.error(f"Error fetching cached signals: {e}")
+    try:
+        user_id = st.session_state.user.get('id') if st.session_state.user else None
+        if not user_id:
+            logger.error("No user_id found in session state for signals")
             return []
+        with db_manager.get_session() as session:
+            signals = db_manager.get_signals(limit=limit, exchange=exchange, user_id=user_id) or []
+            return [s.to_dict() for s in signals]
+    except Exception as e:
+        logger.error(f"Error fetching cached signals: {e}")
+        return []
 
 @st.cache_data
 def get_cached_trades(exchange: str, _is_virtual: bool, limit: int = 5) -> List[Dict[str, Any]]:
     """Fetch and cache recent trades as plain dictionaries"""
-    with db_manager.get_session() as session:
-        try:
-            trades = db_manager.get_trades(status='closed', virtual=_is_virtual, exchange=exchange, limit=limit) or []
-            return [t.to_dict() for t in trades]
-        except Exception as e:
-            logger.error(f"Error fetching cached trades: {e}")
+    try:
+        user_id = st.session_state.user.get('id') if st.session_state.user else None
+        if not user_id:
+            logger.error("No user_id found in session state for trades")
             return []
+        with db_manager.get_session() as session:
+            trades = db_manager.get_trades(status='closed', virtual=_is_virtual, exchange=exchange, limit=limit, user_id=user_id) or []
+            return [t.to_dict() for t in trades]
+    except Exception as e:
+        logger.error(f"Error fetching cached trades: {e}")
+        return []
 
 def main():
     """Main application entry point"""
-    
     try:
         # Application header
         st.title("🚀 AlgoTraderPro V2.0")
         st.markdown("*Advanced Multi-Exchange Cryptocurrency Trading Platform*")
+
+        # Login/Register Section on Main Page
+        if not st.session_state.get('authenticated', False):
+            st.markdown("### 🔐 Login or Register")
+            login_tab, register_tab = st.tabs(["Login", "Register"])
+
+            with login_tab:
+                with st.form("login_form"):
+                    username = st.text_input("Username")
+                    password = st.text_input("Password", type="password")
+                    submit_login = st.form_submit_button("Login")
+                    if submit_login:
+                        if authenticate_user(username, password):
+                            st.session_state.authenticated = True
+                            st.success(f"Welcome, {username}!")
+                            st.rerun()
+                        else:
+                            st.error("Invalid username or password")
+
+            with register_tab:
+                with st.form("register_form"):
+                    new_username = st.text_input("New Username")
+                    new_password = st.text_input("New Password", type="password")
+                    confirm_password = st.text_input("Confirm Password", type="password")
+                    submit_register = st.form_submit_button("Register")
+                    if submit_register:
+                        if new_password == confirm_password:
+                            if register_user(new_username, new_password):
+                                st.success("Registration successful! Please login.")
+                            else:
+                                st.error("Registration failed. Username may already exist.")
+                        else:
+                            st.error("Passwords do not match")
+
+            st.stop()  # Stop rendering until authenticated
 
         # Initialize app if not done
         if not bool(st.session_state.initialized):
             with st.spinner("Initializing AlgoTrader Pro..."):
                 if not initialize_app():
                     st.stop()
+
+        # Welcome message for authenticated user
+        st.markdown(f"👋 Welcome, {st.session_state.user['username']}!")
+
     except Exception as e:
         logger.error(f"Critical error in main: {e}")
         st.error("⚠️ Application Error - Please refresh the page")
@@ -325,15 +448,19 @@ def main():
 
         if st.session_state.trading_engine is not None:
             try:
-                wallet = db_manager.get_wallet_balance(account_type=account_type, exchange=current_exchange)
+                user_id = st.session_state.user.get('id') if st.session_state.user else None
+                if not user_id:
+                    st.error("User ID not found. Please log in again.")
+                    st.stop()
+
+                wallet = db_manager.get_wallet_balance(account_type=account_type, user_id=user_id, exchange=current_exchange)
                 stats = st.session_state.trading_engine.get_trade_statistics(account_type)
 
                 if wallet is not None:
-                    available_val = to_float(wallet.available)
+                    available_val = to_float(wallet.get('available'))
                     st.metric(f"{account_type.title()} Balance", f"${available_val:.2f}")
                 else:
-                    two_decimals = float(0)
-                    st.metric(f"{account_type.title()} Balance", f"${two_decimals:.2f}")
+                    st.metric(f"{account_type.title()} Balance", f"$0.00")
 
                 col1, col2 = st.columns(2)
                 with col1:
