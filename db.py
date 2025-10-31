@@ -15,7 +15,9 @@ load_dotenv()  # This loads .env into os.environ
 logger = get_trading_logger(__name__)
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg2://postgres:kokochulo1234@algotrader-db.ctuauq84wu6f.eu-north-1.rds.amazonaws.com:5432/algotrader-db")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is required but not set")
 TRADING_MODE = os.getenv("TRADING_MODE", "virtual").lower()
 
 # SQLAlchemy setup
@@ -322,8 +324,8 @@ class DatabaseManager:
             except SQLAlchemyError as e:
                 logger.error(f"Error adding signal: {e}")
                 return False
-
-    def get_signals(self, limit: int = 100, exchange: Optional[str] = None, user_id: Optional[int] = None) -> List[Signal]:
+    
+    def get_signals(self, limit: int = 100, exchange: Optional[str] = None, user_id: Optional[int] = None, symbol: Optional[str] = None, side: Optional[str] = None) -> List[Dict[str, Any]]:
         with self.get_session() as session:
             try:
                 query = session.query(Signal)
@@ -331,7 +333,12 @@ class DatabaseManager:
                     query = query.filter(Signal.exchange == exchange)
                 if user_id:
                     query = query.filter(Signal.user_id == user_id)
-                return query.order_by(Signal.created_at.desc()).limit(limit).all()
+                if symbol:
+                    query = query.filter(Signal.symbol == symbol)
+                if side:
+                    query = query.filter(Signal.side == side)
+                signals = query.order_by(Signal.created_at.desc()).limit(limit).all()
+                return [signal.to_dict() for signal in signals]
             except SQLAlchemyError as e:
                 logger.error(f"Error fetching signals: {e}")
                 return []
@@ -348,7 +355,7 @@ class DatabaseManager:
                 logger.error(f"Error adding trade: {e}")
                 return False
 
-    def get_trades(self, limit: int = 100, exchange: Optional[str] = None, virtual: Optional[bool] = None, user_id: Optional[int] = None, hours: Optional[int] = None) -> List[Trade]:
+    def get_trades(self, limit: int = 100, exchange: Optional[str] = None, virtual: Optional[bool] = None, user_id: Optional[int] = None, hours: Optional[int] = None, status: Optional[str] = None) -> List[Trade]:
         with self.get_session() as session:
             try:
                 query = session.query(Trade)
@@ -361,6 +368,8 @@ class DatabaseManager:
                 if hours:
                     since = datetime.now(timezone.utc) - timedelta(hours=hours)
                     query = query.filter(Trade.updated_at >= since)
+                if status:
+                    query = query.filter(Trade.status == status)
                 return query.order_by(Trade.updated_at.desc()).limit(limit).all()
             except SQLAlchemyError as e:
                 logger.error(f"Error fetching trades: {e}")

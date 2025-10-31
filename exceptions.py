@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 class TradingException(Exception):
     """Base exception for trading-related errors"""
-    
+
     def __init__(
         self,
         message: str,
@@ -31,7 +31,7 @@ class TradingException(Exception):
         self.context = context or {}
         self.original_exception = original_exception
         self.timestamp = datetime.utcnow()
-    
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             'error': self.message,
@@ -48,7 +48,7 @@ class APIException(TradingException):
 
 class APIConnectionException(APIException):
     """Exception for API connection issues"""
-    
+
     def __init__(
         self,
         message: str,
@@ -60,7 +60,7 @@ class APIConnectionException(APIException):
         super().__init__(message, context=context, original_exception=original_exception)
         self.endpoint = endpoint
         self.status_code = status_code
-    
+
     def to_dict(self) -> Dict[str, Any]:
         data = super().to_dict()
         data.update({
@@ -71,7 +71,7 @@ class APIConnectionException(APIException):
 
 class APIRateLimitException(APIException):
     """Exception for API rate limit violations"""
-    
+
     def __init__(
         self,
         message: str,
@@ -81,7 +81,7 @@ class APIRateLimitException(APIException):
     ):
         super().__init__(message, context=context, original_exception=original_exception)
         self.retry_after = retry_after
-    
+
     def to_dict(self) -> Dict[str, Any]:
         data = super().to_dict()
         data['retry_after'] = self.retry_after
@@ -93,7 +93,7 @@ class APIAuthenticationException(APIException):
 
 class APITimeoutException(APIException):
     """Exception for API timeout errors"""
-    
+
     def __init__(
         self,
         message: str,
@@ -103,7 +103,7 @@ class APITimeoutException(APIException):
     ):
         super().__init__(message, context=context, original_exception=original_exception)
         self.timeout_duration = timeout_duration
-    
+
     def to_dict(self) -> Dict[str, Any]:
         data = super().to_dict()
         data['timeout_duration'] = self.timeout_duration
@@ -111,7 +111,7 @@ class APITimeoutException(APIException):
 
 class APIDataException(APIException):
     """Exception for API data validation or parsing errors"""
-    
+
     def __init__(
         self,
         message: str,
@@ -121,7 +121,7 @@ class APIDataException(APIException):
     ):
         super().__init__(message, context=context, original_exception=original_exception)
         self.response_data = response_data
-    
+
     def to_dict(self) -> Dict[str, Any]:
         data = super().to_dict()
         data['response_data'] = self.response_data
@@ -183,7 +183,7 @@ def create_error_context(
 ) -> Dict[str, Any]:
     """Create standardized error context"""
     context = {
-        'module': module,
+        'error_module': module,
         'function': function,
         'timestamp': datetime.utcnow().isoformat(),
         'trading_mode': trading_mode or TRADING_MODE
@@ -207,10 +207,10 @@ def handle_trading_exception(
     """Convert generic exceptions to trading exceptions with proper context"""
     if isinstance(exception, TradingException):
         return exception
-    
+
     context = context or {}
     error_str = str(exception).lower()
-    
+
     # Map specific API errors
     if "rate limit" in error_str or "429" in error_str:
         trading_exception = APIRateLimitException(
@@ -282,12 +282,12 @@ def handle_trading_exception(
             context=context,
             original_exception=exception
         )
-    
+
     logger.error(
         f"Trading exception: {trading_exception.message}",
         extra={'context': trading_exception.to_dict()}
     )
-    
+
     # Log to database if ErrorLog and add_error_log are available
     try:
         from db import DatabaseManager, ErrorLog
@@ -312,5 +312,5 @@ def handle_trading_exception(
     finally:
         if 'db_manager' in locals():
             db_manager.session.close()
-    
+
     return trading_exception

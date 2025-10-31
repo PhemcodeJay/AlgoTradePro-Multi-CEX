@@ -4,7 +4,7 @@ import time
 import threading
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional
-from signal_generator import generate_signals, get_symbols, get_signal_summary
+from signal_generator import generate_signals, get_top_symbols, get_signal_summary
 from ml import MLFilter
 from notifications import send_all_notifications
 from logging_config import get_trading_logger
@@ -93,7 +93,7 @@ class AutomatedTrader:
         try:
             self.scan_count += 1
             self.last_scan_time = datetime.now(timezone.utc)
-            symbols = get_symbols(self.trading_engine.exchange_name, limit=50)
+            symbols = get_top_symbols(self.trading_engine.exchange_name, limit=50)
             if not symbols:
                 logger.warning("No symbols retrieved for trading")
                 return

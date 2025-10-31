@@ -38,35 +38,18 @@ class RateLimitInfo:
     minute_count: int = 0
 
 class BinanceClient:
-    def __init__(self, user_id: Optional[int] = None):
-        """Initialize Binance client with user-specific API keys"""
+    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None):
         try:
-            if user_id:
-                from db import db_manager
-                user = db_manager.get_user_by_id(user_id)
-                if not user or not user["binance_api_key"]:
-                    raise APIConnectionException("No Binance API credentials found for user")
-                self.api_key = user["binance_api_key"]
-                self.api_secret = user["binance_api_secret"]
-            else:
-                self.api_key = os.getenv("BINANCE_API_KEY")
-                self.api_secret = os.getenv("BINANCE_API_SECRET")
-                if not self.api_key or not self.api_secret:
-                    raise APIConnectionException("BINANCE_API_KEY or BINANCE_API_SECRET not set")
-
-            self._request_count = 0
-            self._last_reset = datetime.now(timezone.utc)
+            self.api_key = api_key or os.getenv("BINANCE_API_KEY", "")
+            self.api_secret = api_secret or os.getenv("BINANCE_API_SECRET", "")
+            if not self.api_key or not self.api_secret:
+                raise APIConnectionException("Binance API key or secret not provided")
         except Exception as e:
-            raise APIConnectionException(
-                f"Failed to initialize API credentials: {str(e)}",
-                endpoint='api_init',
-                context=create_error_context(module=__name__, function='__init__'),
-                original_exception=e
-            )
+            raise APIConnectionException(f"Failed to initialize API credentials: {str(e)}")
 
-        self.account_type: str = os.getenv("BINANCE_ACCOUNT_TYPE", "FUTURES").upper()
-        self.base_url: str = "https://api.binance.com"
-        self.ws_url: str = "wss://stream.binance.com:9443"
+        self.account_type = os.getenv("BINANCE_ACCOUNT_TYPE", "FUTURES").upper()
+        self.base_url = "https://api.binance.com"
+        self.ws_url = "wss://stream.binance.com:9443"
         self.session = None
         self.ws_connection = None
         self.loop = None
@@ -103,7 +86,7 @@ class BinanceClient:
         self._test_connection()
         self._start_background_loop()
 
-        logger.info(f"BinanceClient initialized - Environment: mainnet - Account Type: {self.account_type}")
+        logger.info(f"BinanceClient initialized - mainnet - {self.account_type}")
 
     def _initialize_session(self):
         try:
@@ -203,43 +186,37 @@ class BinanceClient:
         else:
             raise APIException(f"API Error (code {error_code}): {error_msg}", error_code=str(error_code), context=create_error_context(module=__name__, function='_handle_api_error', extra_data={'endpoint': endpoint, 'error_code': error_code}))
 
-    def _make_request(self, method: str, endpoint: str, params: Dict[str, Any] = None) -> Optional[Dict]:
+    def _make_request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Dict[str, Any] = None,
+        *,
+        signed: bool = False
+    ) -> Optional[Dict]:
         try:
             self.total_requests += 1
-            with self.rate_limit_lock:
-                current_time = time.time()
-                if current_time - self.rate_limit.last_request_time < 1.0 / self.rate_limit.requests_per_second:
-                    time.sleep(1.0 / self.rate_limit.requests_per_second)
-                if current_time - self.rate_limit.minute_start >= 60:
-                    self.rate_limit.minute_count = 0
-                    self.rate_limit.minute_start = current_time
-                if self.rate_limit.minute_count >= self.rate_limit.requests_per_minute:
-                    sleep_time = 60 - (current_time - self.rate_limit.minute_start)
-                    if sleep_time > 0:
-                        time.sleep(sleep_time)
-                    self.rate_limit.minute_count = 0
-                    self.rate_limit.minute_start = time.time()
-                self.rate_limit.minute_count += 1
-                self.rate_limit.last_request_time = time.time()
+            self._check_rate_limit()
 
             url = f"{self.base_url}{endpoint}"
             headers = {'X-MBX-APIKEY': self.api_key}
-            timestamp = str(int(time.time() * 1000))
-            if params is None:
-                params = {}
-            params['timestamp'] = timestamp
-            query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
-            signature = hmac.new(
-                self.api_secret.encode('utf-8'),
-                query_string.encode('utf-8'),
-                hashlib.sha256
-            ).hexdigest()
-            params['signature'] = signature
+
+            # Only add timestamp + signature for signed (private) endpoints
+            if signed:
+                if params is None:
+                    params = {}
+                params['timestamp'] = str(int(time.time() * 1000))
+                query_string = '&'.join([f"{k}={v}" for k, v in params.items()])
+                params['signature'] = hmac.new(
+                    self.api_secret.encode('utf-8'),
+                    query_string.encode('utf-8'),
+                    hashlib.sha256
+                ).hexdigest()
 
             response = self.session.request(
                 method,
                 url,
-                params=params,
+                params=params if params else None,
                 headers=headers,
                 timeout=(self.connect_timeout, self.request_timeout)
             )
@@ -264,7 +241,8 @@ class BinanceClient:
 
     def _test_connection(self):
         try:
-            self._make_request("GET", "/api/v3/ping")
+            # /ping is public → no signature
+            self._make_request("GET", "/api/v3/ping", signed=False)
             self._connected = True
             logger.info("Binance connection test successful")
         except Exception as e:
@@ -306,7 +284,7 @@ class BinanceClient:
             cached = self._price_cache.get(symbol)
             if cached and (time.time() - cached[0]) < 60:
                 return cached[1]
-            ticker = self._make_request("GET", "/api/v3/ticker/price", {"symbol": symbol.replace('/', '')})
+            ticker = self._make_request("GET", "/api/v3/ticker/price", {"symbol": symbol.replace('/', '')}, signed=False)
             price = float(ticker.get("price", 0))
             if price > 0:
                 self._price_cache[symbol] = (time.time(), price)
@@ -374,10 +352,10 @@ class BinanceClient:
         klines = []
         current_time = int(time.time() * 1000)
         interval_ms = 3600000  # 1 hour
-        limit = max(limit, 200)  # Ensure enough data for SMA_200
+        limit = max(limit, 200)
         for i in range(limit):
             timestamp = current_time - (limit - i) * interval_ms
-            open_price = base_price * (1 + random.uniform(-0.05, 0.05))  # Increased volatility
+            open_price = base_price * (1 + random.uniform(-0.05, 0.05))
             close_price = open_price * (1 + random.uniform(-0.07, 0.07))
             high_price = max(open_price, close_price) * (1 + random.uniform(0, 0.03))
             low_price = min(open_price, close_price) * (1 - random.uniform(0, 0.03))
@@ -396,7 +374,7 @@ class BinanceClient:
     
     def get_balance(self) -> Dict[str, float]:
         try:
-            result = self._make_request("GET", "/fapi/v2/balance")
+            result = self._make_request("GET", "/fapi/v2/balance", signed=True)
             for asset in result:
                 if asset['asset'] == 'USDT':
                     return {
@@ -478,7 +456,7 @@ class BinanceClient:
                 params["stopLossPrice"] = str(round(float(stopLoss), 6))
             if takeProfit is not None:
                 params["takeProfitPrice"] = str(round(float(takeProfit), 6))
-            result = await asyncio.to_thread(self._make_request, "POST", "/api/v3/order", params)
+            result = await asyncio.to_thread(self._make_request, "POST", "/api/v3/order", params, signed=True)
             if result:
                 order_id = result.get("orderId")
                 order = {
@@ -539,7 +517,7 @@ class BinanceClient:
                     logger.warning("DatabaseManager.get_trade not available, assuming virtual order cancellation")
                     return True
             params = {"symbol": symbol.replace('/', ''), "orderId": order_id}
-            result = await asyncio.to_thread(self._make_request, "DELETE", "/api/v3/order", params)
+            result = await asyncio.to_thread(self._make_request, "DELETE", "/api/v3/order", params, signed=True)
             if result:
                 if hasattr(db_manager, 'get_trade'):
                     trade = db_manager.get_trade(order_id)
@@ -559,7 +537,7 @@ class BinanceClient:
             if symbol and not '/' in symbol and symbol.endswith('USDT'):
                 symbol = symbol.replace('USDT', '/USDT')
             params = {"symbol": symbol.replace('/', '')} if symbol else {}
-            result = self._make_request("GET", "/api/v3/openOrders", params)
+            result = self._make_request("GET", "/api/v3/openOrders", params, signed=True)
             orders: List[Dict[str, Any]] = []
             for order in result:
                 orders.append({
@@ -583,7 +561,7 @@ class BinanceClient:
             if symbol and not '/' in symbol and symbol.endswith('USDT'):
                 symbol = symbol.replace('/', '')
             params = {"symbol": symbol} if symbol else {}
-            result = await asyncio.to_thread(self._make_request, "GET", "/fapi/v2/positionRisk", params)
+            result = await asyncio.to_thread(self._make_request, "GET", "/fapi/v2/positionRisk", params, signed=True)
             positions: List[Dict] = []
             for pos in result:
                 size = float(pos.get("positionAmt", 0))
@@ -618,7 +596,7 @@ class BinanceClient:
             if not '/' in symbol and symbol.endswith('USDT'):
                 symbol = symbol.replace('USDT', '/USDT')
             params = {"symbol": symbol.replace('/', ''), "leverage": str(leverage)}
-            self._make_request("POST", "/fapi/v1/leverage", params)
+            self._make_request("POST", "/fapi/v1/leverage", params, signed=True)
             logger.info(f"Binance leverage set to {leverage}x for {symbol}")
             return True
         except Exception as e:
@@ -627,7 +605,7 @@ class BinanceClient:
 
     def get_trading_fees(self, symbol: Optional[str] = None) -> Dict[str, Any]:
         try:
-            result = self._make_request("GET", "/api/v3/account")
+            result = self._make_request("GET", "/api/v3/account", signed=True)
             fees: Dict[str, Any] = {}
             if result and "makerCommission" in result and "takerCommission" in result:
                 fee_rate = {

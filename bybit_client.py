@@ -38,51 +38,44 @@ class RateLimitInfo:
     minute_count: int = 0
 
 class BybitClient:
-    def __init__(self):
-        self.api_key: str = os.getenv("BYBIT_API_KEY", "")
-        self.api_secret: str = os.getenv("BYBIT_API_SECRET", "")
-        self.account_type: str = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED").upper()
+    def __init__(self, api_key: Optional[str] = None, api_secret: Optional[str] = None):
+        self.api_key = api_key or os.getenv("BYBIT_API_KEY", "")
+        self.api_secret = api_secret or os.getenv("BYBIT_API_SECRET", "")
+        self.account_type = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED").upper()
 
-        # Mainnet only
-        self.base_url: str = "https://api.bybit.com"
-        self.ws_url: str = "wss://stream.bybit.com"
+        self.base_url = "https://api.bybit.com"
+        self.ws_url = "wss://stream.bybit.com"
 
-        if os.getenv("BYBIT_MAINNET", "true").lower() != "true":
-            raise ValueError("Mainnet only mode is enabled. Please set BYBIT_MAINNET=true")
-        
-        # Connection and session management
-        self.session: Optional[requests.Session] = None
+        if not self.api_key or not self.api_secret:
+            raise APIConnectionException("Bybit API key or secret not provided")
+
+        self.session = None
         self.ws_connection = None
         self.loop = None
         self._price_cache: Dict[str, tuple[float, float]] = {}
         self._connected = False
         self._connection_lock = threading.Lock()
         
-        # Rate limiting
         self.rate_limit = RateLimitInfo()
         self.rate_limit_lock = threading.Lock()
         
-        # Error handling
         self.recovery_strategy = APIErrorRecoveryStrategy(max_retries=3, delay=1.0)
         self.last_error_time = None
         self.consecutive_errors = 0
         
-        # Timeout configuration
         self.request_timeout = 30
         self.connect_timeout = 10
         
-        # Health monitoring
         self.last_successful_request = None
         self.total_requests = 0
         self.successful_requests = 0
         self.failed_requests = 0
         
-        # Initialize connection
         self._initialize_session()
         self._test_connection()
         self._start_background_loop()
         
-        logger.info(f"BybitClient initialized - Environment: mainnet - Account Type: {self.account_type}")
+        logger.info(f"BybitClient initialized - mainnet - {self.account_type}")
     
     def _initialize_session(self):
         try:
