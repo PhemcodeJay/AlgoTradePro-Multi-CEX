@@ -12,26 +12,35 @@ import bcrypt
 st.set_page_config(
     page_title="Performance - AlgoTraderPro V2.0",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
 # Initialize logger
 logger = get_trading_logger(__name__)
 
-# Initialize session state
+# Header
+st.markdown("""
+<div style='padding: 1.5rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 1.5rem;'>
+    <h1 style='color: white; margin: 0;'>📊 Performance Analytics</h1>
+    <p style='color: white; margin: 0.5rem 0 0 0;'>Analyze trading performance for {}</p>
+</div>
+""".format(st.session_state.get('user', {}).get('username', 'N/A')), unsafe_allow_html=True)
+
+# Authentication
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
 if 'user' not in st.session_state:
     st.session_state.user = None
 
-# Authentication functions
 def authenticate_user(username: str, password: str) -> bool:
-    """Authenticate user against the database with hashed password."""
     try:
         with db_manager.get_session() as session:
             user = session.query(User).filter_by(username=username).first()
             if user and bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
                 st.session_state.user = {'id': user.id, 'username': user.username}
+                st.session_state.authenticated = True
+                logger.info(f"User {username} authenticated successfully")
                 return True
             return False
     except Exception as e:
@@ -39,7 +48,6 @@ def authenticate_user(username: str, password: str) -> bool:
         return False
 
 def register_user(username: str, password: str) -> bool:
-    """Register a new user with hashed password and initialize wallet balances."""
     try:
         with db_manager.get_session() as session:
             if session.query(User).filter_by(username=username).first():
@@ -62,9 +70,9 @@ def register_user(username: str, password: str) -> bool:
             session.add(WalletBalance(
                 user_id=new_user.id,
                 account_type="virtual",
-                available=100.0,
+                available=1000.0,
                 used=0.0,
-                total=100.0,
+                total=1000.0,
                 currency="USDT",
                 exchange=st.session_state.get('current_exchange', 'binance')
             ))
@@ -87,36 +95,53 @@ def register_user(username: str, password: str) -> bool:
 
 # Login/Register UI
 if not st.session_state.get('authenticated', False):
-    st.markdown("### 🔐 Login or Register")
+    st.markdown("### 🔐 Performance Access")
+    st.markdown("""
+    **Instructions:**
+    - **Login**: Enter your username and password to access performance analytics.
+    - **Register**: Create a new account to start tracking performance. Passwords must be at least 6 characters.
+    - **Note**: Performance data is specific to your selected exchange and trading mode.
+    """)
+    
     login_tab, register_tab = st.tabs(["Login", "Register"])
 
     with login_tab:
+        st.markdown("#### Login to Your Account")
         with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            submit_login = st.form_submit_button("Login")
+            username = st.text_input("Username", placeholder="Enter your username")
+            password = st.text_input("Password", type="password", placeholder="Enter your password")
+            submit_login = st.form_submit_button("Login", use_container_width=True)
             if submit_login:
-                if authenticate_user(username, password):
-                    st.session_state.authenticated = True
-                    st.success(f"Welcome, {username}!")
-                    st.rerun()
+                if username and password:
+                    with st.spinner("Authenticating..."):
+                        if authenticate_user(username, password):
+                            st.success(f"✅ Welcome back, {username}!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Invalid username or password")
                 else:
-                    st.error("Invalid username or password")
+                    st.error("Please enter both username and password")
 
     with register_tab:
+        st.markdown("#### Create New Account")
         with st.form("register_form"):
-            new_username = st.text_input("New Username")
-            new_password = st.text_input("New Password", type="password")
-            confirm_password = st.text_input("Confirm Password", type="password")
-            submit_register = st.form_submit_button("Register")
+            new_username = st.text_input("New Username", placeholder="Choose a username")
+            new_password = st.text_input("New Password", type="password", placeholder="Choose a password")
+            confirm_password = st.text_input("Confirm Password", type="password", placeholder="Confirm your password")
+            submit_register = st.form_submit_button("Register", use_container_width=True)
             if submit_register:
-                if new_password == confirm_password:
-                    if register_user(new_username, new_password):
-                        st.success("Registration successful! Please login.")
-                    else:
-                        st.error("Registration failed. Username may already exist.")
+                if not all([new_username, new_password, confirm_password]):
+                    st.error("Please fill in all fields")
+                elif new_password != confirm_password:
+                    st.error("❌ Passwords do not match")
+                elif len(new_password) < 6:
+                    st.error("❌ Password must be at least 6 characters")
                 else:
-                    st.error("Passwords do not match")
+                    with st.spinner("Creating account..."):
+                        if register_user(new_username, new_password):
+                            st.success("✅ Registration successful! Please login with your credentials.")
+                        else:
+                            st.error("❌ Registration failed. Username may already exist.")
 
     st.stop()
 
@@ -129,51 +154,85 @@ trading_engine = st.session_state.trading_engine
 current_exchange = st.session_state.get('current_exchange', 'binance')
 account_type = st.session_state.get('account_type', 'virtual')
 user_id = st.session_state.user.get('id') if st.session_state.user else None
+username = st.session_state.user.get('username', 'N/A')
 
 if not user_id:
     st.error("User not authenticated. Please log in from the main page.")
     st.stop()
 
-st.title("📊 Performance Analytics")
-st.markdown(f"**Exchange:** {current_exchange.title()} | **Mode:** {account_type.title()}")
+# Quick Info Cards
+st.markdown("### 📋 Quick Information")
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.markdown(f"""
+    <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #667eea;'>
+        <h4 style='margin: 0; color: #667eea;'>🏦 Exchange</h4>
+        <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{current_exchange.title()}</p>
+    </div>
+    """, unsafe_allow_html=True)
+with col2:
+    st.markdown(f"""
+    <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #764ba2;'>
+        <h4 style='margin: 0; color: #764ba2;'>🎯 Mode</h4>
+        <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{account_type.title()}</p>
+    </div>
+    """, unsafe_allow_html=True)
+with col3:
+    st.markdown(f"""
+    <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #10b981;'>
+        <h4 style='margin: 0; color: #10b981;'>👤 User</h4>
+        <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{username}</p>
+    </div>
+    """, unsafe_allow_html=True)
+with col4:
+    wallet = db_manager.get_wallet_balance(account_type, user_id=user_id, exchange=current_exchange)
+    balance = wallet.get('available', 1000.0 if account_type == 'virtual' else 0.0)
+    st.markdown(f"""
+    <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #f59e0b;'>
+        <h4 style='margin: 0; color: #f59e0b;'>💸 Balance</h4>
+        <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>${balance:.2f}</p>
+    </div>
+    """, unsafe_allow_html=True)
 
-# Performance overview
-st.subheader("🎯 Portfolio Performance")
+st.divider()
+
+st.markdown("""
+### 🎯 Portfolio Performance
+**Instructions:**
+- View key performance metrics such as portfolio value, total P&L, win rate, and total trades.
+- Use tabs to dive deeper into P&L, risk, trade, symbol, and ML performance analyses.
+""")
 
 try:
     stats = trading_engine.get_trade_statistics(account_type) or {}
-    
     wallet = db_manager.get_wallet_balance(account_type, user_id=user_id, exchange=current_exchange)
-    current_balance = wallet.get('available', 100.0 if account_type == 'virtual' else 0.0)
-    initial_balance = wallet.get('total', 100.0) if account_type == 'virtual' else 0.0
+    current_balance = wallet.get('available', 1000.0 if account_type == 'virtual' else 0.0)
+    initial_balance = wallet.get('total', 1000.0) if account_type == 'virtual' else 0.0
     
-    col1, col2, col3, col4 = st.columns(4)
-    
+    col1, col2, col3 = st.columns(3)
     with col1:
         total_return = current_balance - initial_balance
         return_pct = (total_return / initial_balance) * 100 if initial_balance > 0 else 0
         st.metric("Portfolio Value", f"${current_balance:.2f}", delta=f"{return_pct:+.2f}%")
-    
     with col2:
         st.metric("Total P&L", f"${stats.get('total_pnl', 0):.2f}")
-    
     with col3:
         st.metric("Win Rate", f"{stats.get('win_rate', 0):.1f}%")
-    
-    with col4:
-        st.metric("Total Trades", stats.get('total_trades', 0))
-
 except Exception as e:
-    logger.error(f"Error loading performance overview: {e}")
-    st.error(f"Error loading performance overview: {e}")
+    logger.error(f"Error loading portfolio performance: {e}")
+    st.error(f"Error loading portfolio performance: {e}")
 
 st.divider()
 
-# Detailed performance analysis
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["P&L Analysis", "Risk Metrics", "Trade Analysis", "Symbol Performance", "ML Performance"])
 
 with tab1:
-    st.subheader("💹 Profit & Loss Analysis")
+    st.markdown("""
+    ### 💹 P&L Analysis
+    **Instructions:**
+    - Analyze cumulative P&L and trade P&L distribution.
+    - Review key performance indicators and monthly performance summaries.
+    """)
     
     try:
         closed_trades = db_manager.get_trades(
@@ -195,7 +254,7 @@ with tab1:
                 if trade.get('pnl') is not None:
                     trade_date = trade.get('updated_at') or trade.get('created_at')
                     if isinstance(trade_date, str):
-                        trade_date = datetime.fromisoformat(trade_date)
+                        trade_date = datetime.fromisoformat(trade_date.replace('Z', '+00:00'))
                     trade_dates.append(trade_date)
                     running_pnl += trade['pnl']
                     cumulative_pnl.append(running_pnl)
@@ -229,7 +288,7 @@ with tab1:
                         x=daily_pnl,
                         nbins=min(30, len(daily_pnl)),
                         title="Trade P&L Distribution",
-                        color_discrete_sequence=['green']
+                        color_discrete_sequence=['#636EFA']
                     )
                     fig_dist.update_layout(
                         xaxis_title="P&L ($)",
@@ -238,33 +297,26 @@ with tab1:
                     )
                     st.plotly_chart(fig_dist, use_container_width=True)
                 
-                st.subheader("📈 Key Performance Indicators")
+                st.markdown("**Key Performance Indicators**")
                 profitable_trades = [p for p in daily_pnl if p > 0]
                 losing_trades = [p for p in daily_pnl if p < 0]
                 
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Best Trade", f"${max(daily_pnl):.2f}" if daily_pnl else "$0.00")
                     st.metric("Worst Trade", f"${min(daily_pnl):.2f}" if daily_pnl else "$0.00")
-                
                 with col2:
                     avg_win = sum(profitable_trades) / len(profitable_trades) if profitable_trades else 0
                     avg_loss = sum(losing_trades) / len(losing_trades) if losing_trades else 0
                     st.metric("Avg Win", f"${avg_win:.2f}")
                     st.metric("Avg Loss", f"${avg_loss:.2f}")
-                
                 with col3:
                     profit_factor = abs(sum(profitable_trades) / sum(losing_trades)) if losing_trades else float('inf')
                     st.metric("Profit Factor", f"{profit_factor:.2f}")
-                    st.metric("Total Trades", len(daily_pnl))
-                
-                with col4:
-                    win_rate = (len(profitable_trades) / len(daily_pnl)) * 100 if daily_pnl else 0
                     expectancy = sum(daily_pnl) / len(daily_pnl) if daily_pnl else 0
-                    st.metric("Win Rate", f"{win_rate:.1f}%")
                     st.metric("Expectancy", f"${expectancy:.2f}")
                 
-                st.subheader("📅 Monthly Performance")
+                st.markdown("**Monthly Performance**")
                 monthly_data = {}
                 for i, trade_date in enumerate(trade_dates):
                     month_key = trade_date.strftime('%Y-%m')
@@ -286,14 +338,19 @@ with tab1:
                     st.dataframe(df_monthly, use_container_width=True)
         
         else:
-            st.info("No closed trades available for P&L analysis")
+            st.info("📭 No closed trades available for P&L analysis")
     
     except Exception as e:
         logger.error(f"Error in P&L analysis: {e}")
         st.error(f"Error in P&L analysis: {e}")
 
 with tab2:
-    st.subheader("⚠️ Risk Metrics")
+    st.markdown("""
+    ### ⚠️ Risk Metrics
+    **Instructions:**
+    - Evaluate risk metrics such as max drawdown, Sharpe ratio, and VaR.
+    - Analyze drawdown trends and risk by trade duration.
+    """)
     
     try:
         closed_trades = db_manager.get_trades(
@@ -320,35 +377,20 @@ with tab2:
                 avg_return = np.mean(pnl_values)
                 sharpe_ratio = avg_return / std_dev if std_dev > 0 else 0
                 
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Max Drawdown", f"${max_drawdown:.2f}")
                     st.metric("Std Deviation", f"${std_dev:.2f}")
-                
                 with col2:
                     st.metric("Downside Deviation", f"${downside_deviation:.2f}")
                     st.metric("Sharpe Ratio", f"{sharpe_ratio:.3f}")
-                
                 with col3:
                     var_95 = np.percentile(pnl_values, 5)
                     st.metric("VaR (95%)", f"${var_95:.2f}")
-                    consecutive_losses = 0
-                    max_consecutive_losses = 0
-                    for pnl in pnl_values:
-                        if pnl < 0:
-                            consecutive_losses += 1
-                            max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
-                        else:
-                            consecutive_losses = 0
-                    st.metric("Max Consecutive Losses", max_consecutive_losses)
-                
-                with col4:
                     risk_adj_return = avg_return / abs(max_drawdown) if max_drawdown != 0 else 0
                     st.metric("Risk-Adj Return", f"{risk_adj_return:.3f}")
-                    recovery_factor = sum(pnl_values) / abs(max_drawdown) if max_drawdown != 0 else 0
-                    st.metric("Recovery Factor", f"{recovery_factor:.2f}")
                 
-                st.subheader("📉 Drawdown Analysis")
+                st.markdown("**Drawdown Analysis**")
                 drawdown_dates = [trade.get('updated_at') or trade.get('created_at') 
                                  for trade in sorted(trade_data, key=lambda x: x.get('updated_at') or x.get('created_at'))
                                  if trade.get('pnl') is not None]
@@ -372,14 +414,14 @@ with tab2:
                 )
                 st.plotly_chart(fig_dd, use_container_width=True)
                 
-                st.subheader("⏱️ Risk by Trade Duration")
+                st.markdown("**Risk by Trade Duration**")
                 duration_risk = []
                 for trade in trade_data:
                     if trade.get('pnl') is not None and trade.get('created_at') and trade.get('updated_at'):
                         if isinstance(trade['created_at'], str):
-                            trade['created_at'] = datetime.fromisoformat(trade['created_at'])
+                            trade['created_at'] = datetime.fromisoformat(trade['created_at'].replace('Z', '+00:00'))
                         if isinstance(trade['updated_at'], str):
-                            trade['updated_at'] = datetime.fromisoformat(trade['updated_at'])
+                            trade['updated_at'] = datetime.fromisoformat(trade['updated_at'].replace('Z', '+00:00'))
                         duration_hours = (trade['updated_at'] - trade['created_at']).total_seconds() / 3600
                         duration_risk.append({
                             'Duration (Hours)': duration_hours,
@@ -400,14 +442,19 @@ with tab2:
                     st.plotly_chart(fig_duration, use_container_width=True)
         
         else:
-            st.info("No closed trades available for risk analysis")
+            st.info("📭 No closed trades available for risk analysis")
     
     except Exception as e:
         logger.error(f"Error in risk analysis: {e}")
         st.error(f"Error in risk analysis: {e}")
 
 with tab3:
-    st.subheader("🔍 Trade Analysis")
+    st.markdown("""
+    ### 🔍 Trade Analysis
+    **Instructions:**
+    - Examine trade size and return distributions.
+    - Analyze performance by trade side and timing (hour/day).
+    """)
     
     try:
         closed_trades = db_manager.get_trades(
@@ -438,11 +485,13 @@ with tab3:
                     fig_size = px.histogram(
                         x=trade_sizes,
                         nbins=20,
-                        title="Trade Size Distribution"
+                        title="Trade Size Distribution",
+                        color_discrete_sequence=['#636EFA']
                     )
                     fig_size.update_layout(
                         xaxis_title="Trade Value ($)",
-                        yaxis_title="Number of Trades"
+                        yaxis_title="Number of Trades",
+                        height=400
                     )
                     st.plotly_chart(fig_size, use_container_width=True)
                 
@@ -450,15 +499,17 @@ with tab3:
                     fig_returns = px.histogram(
                         x=trade_returns,
                         nbins=20,
-                        title="Trade Return Distribution (%)"
+                        title="Trade Return Distribution (%)",
+                        color_discrete_sequence=['#636EFA']
                     )
                     fig_returns.update_layout(
                         xaxis_title="Return (%)",
-                        yaxis_title="Number of Trades"
+                        yaxis_title="Number of Trades",
+                        height=400
                     )
                     st.plotly_chart(fig_returns, use_container_width=True)
                 
-                st.write("**Performance by Trade Side:**")
+                st.markdown("**Performance by Trade Side**")
                 side_performance = {}
                 for i, side in enumerate(sides):
                     side_performance.setdefault(side, []).append(trade_returns[i])
@@ -477,14 +528,14 @@ with tab3:
                 df_sides = pd.DataFrame(side_summary)
                 st.dataframe(df_sides, use_container_width=True)
                 
-                st.write("**Trade Timing Analysis:**")
+                st.markdown("**Trade Timing Analysis**")
                 hour_performance = {}
                 day_performance = {}
                 
                 for trade in trade_data:
                     if trade.get('pnl') is not None and trade.get('created_at'):
                         if isinstance(trade['created_at'], str):
-                            trade['created_at'] = datetime.fromisoformat(trade['created_at'])
+                            trade['created_at'] = datetime.fromisoformat(trade['created_at'].replace('Z', '+00:00'))
                         trade_time = trade['created_at']
                         hour = trade_time.hour
                         day = trade_time.strftime('%A')
@@ -500,11 +551,13 @@ with tab3:
                         fig_hourly = px.bar(
                             x=hours,
                             y=avg_hourly_returns,
-                            title="Average Return by Hour of Day"
+                            title="Average Return by Hour of Day",
+                            color_discrete_sequence=['#636EFA']
                         )
                         fig_hourly.update_layout(
                             xaxis_title="Hour",
-                            yaxis_title="Average Return (%)"
+                            yaxis_title="Average Return (%)",
+                            height=400
                         )
                         st.plotly_chart(fig_hourly, use_container_width=True)
                 
@@ -515,23 +568,30 @@ with tab3:
                         fig_daily = px.bar(
                             x=days,
                             y=avg_daily_returns,
-                            title="Average Return by Day of Week"
+                            title="Average Return by Day of Week",
+                            color_discrete_sequence=['#636EFA']
                         )
                         fig_daily.update_layout(
                             xaxis_title="Day",
-                            yaxis_title="Average Return (%)"
+                            yaxis_title="Average Return (%)",
+                            height=400
                         )
                         st.plotly_chart(fig_daily, use_container_width=True)
         
         else:
-            st.info("No closed trades available for trade analysis")
+            st.info("📭 No closed trades available for trade analysis")
     
     except Exception as e:
         logger.error(f"Error in trade analysis: {e}")
         st.error(f"Error in trade analysis: {e}")
 
 with tab4:
-    st.subheader("🏷️ Symbol Performance")
+    st.markdown("""
+    ### 🏷️ Symbol Performance
+    **Instructions:**
+    - Review performance metrics for each traded symbol.
+    - Visualize top/bottom performers and symbol return correlations.
+    """)
     
     try:
         closed_trades = db_manager.get_trades(
@@ -592,7 +652,7 @@ with tab4:
                 styled_df = df_symbols.style.applymap(color_pnl, subset=['Total P&L'])
                 st.dataframe(styled_df, use_container_width=True)
                 
-                st.write("**Top/Bottom Performers:**")
+                st.markdown("**Top/Bottom Performers**")
                 symbols = [s['Symbol'] for s in symbol_summary[:10]]
                 total_pnls = [float(s['Total P&L'].replace('$', '').replace(',', '')) for s in symbol_summary[:10]]
                 
@@ -612,13 +672,13 @@ with tab4:
                 st.plotly_chart(fig_performers, use_container_width=True)
                 
                 if len(symbol_stats) > 1:
-                    st.write("**Symbol Return Correlations:**")
+                    st.markdown("**Symbol Return Correlations**")
                     symbol_returns = {}
                     max_trades = max(len(stats['pnl_list']) for stats in symbol_stats.values())
                     
                     for symbol, stats in symbol_stats.items():
                         if len(stats['pnl_list']) >= 5:
-                            returns = [pnl / 100 for pnl in stats['pnl_list'][:20]]  # Simplified returns
+                            returns = [pnl / 100 for pnl in stats['pnl_list'][:20]]
                             symbol_returns[symbol] = returns
                     
                     if len(symbol_returns) > 1:
@@ -633,14 +693,19 @@ with tab4:
                         st.plotly_chart(fig_corr, use_container_width=True)
         
         else:
-            st.info("No closed trades available for symbol analysis")
+            st.info("📭 No closed trades available for symbol analysis")
     
     except Exception as e:
         logger.error(f"Error in symbol analysis: {e}")
         st.error(f"Error in symbol analysis: {e}")
 
 with tab5:
-    st.subheader("🤖 ML Performance")
+    st.markdown("""
+    ### 🤖 ML Performance
+    **Instructions:**
+    - Evaluate the performance of the ML model, including feature importance and accuracy trends.
+    - Compare ML-enhanced signals vs. traditional signals.
+    """)
     
     try:
         from ml import MLFilter
@@ -651,7 +716,7 @@ with tab5:
             
             importance = ml_filter.get_feature_importance()
             if importance:
-                st.write("**Feature Importance:**")
+                st.markdown("**Feature Importance**")
                 features = list(importance.keys())
                 importances = list(importance.values())
                 
@@ -672,7 +737,7 @@ with tab5:
                 ])
                 st.dataframe(importance_df, use_container_width=True)
             
-            st.write("**ML Feedback Analysis:**")
+            st.markdown("**ML Feedback Analysis**")
             feedback_data = db_manager.get_feedback(
                 limit=100,
                 exchange=current_exchange,
@@ -685,18 +750,13 @@ with tab5:
                 total_feedback = len(feedback_list)
                 ml_accuracy = (positive_feedback / total_feedback) * 100 if total_feedback > 0 else 0
                 
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Total Feedback", total_feedback)
                 with col2:
                     st.metric("Positive Outcomes", positive_feedback)
                 with col3:
                     st.metric("ML Accuracy", f"{ml_accuracy:.1f}%")
-                with col4:
-                    recent_feedback = len([f for f in feedback_list 
-                                         if isinstance(f.get('timestamp'), datetime) and 
-                                         f['timestamp'] > datetime.now(timezone.utc) - timedelta(days=7)])
-                    st.metric("Recent Feedback", recent_feedback)
                 
                 if len(feedback_list) > 5:
                     feedback_dates = [f['timestamp'] for f in feedback_list if isinstance(f.get('timestamp'), datetime)]
@@ -728,7 +788,7 @@ with tab5:
                         )
                         st.plotly_chart(fig_ml_trend, use_container_width=True)
                 
-                st.write("**ML vs. Traditional Signal Performance:**")
+                st.markdown("**ML vs. Traditional Signal Performance**")
                 recent_signals = db_manager.get_signals(
                     limit=100,
                     exchange=current_exchange,
@@ -762,7 +822,8 @@ with tab5:
                                 df_comparison,
                                 x='Type',
                                 y='Avg Score',
-                                title="Average Signal Score Comparison"
+                                title="Average Signal Score Comparison",
+                                color_discrete_sequence=['#636EFA']
                             )
                             st.plotly_chart(fig_comparison, use_container_width=True)
                         with col2:
@@ -770,12 +831,13 @@ with tab5:
                                 df_comparison,
                                 x='Type',
                                 y='Count',
-                                title="Signal Count Comparison"
+                                title="Signal Count Comparison",
+                                color_discrete_sequence=['#636EFA']
                             )
                             st.plotly_chart(fig_count, use_container_width=True)
             
             else:
-                st.info("No ML feedback data available")
+                st.info("📭 No ML feedback data available")
         
         else:
             st.warning("⚠️ ML Model is not loaded")
@@ -785,14 +847,18 @@ with tab5:
         logger.error(f"Error in ML performance analysis: {e}")
         st.error(f"Error in ML performance analysis: {e}")
 
-# Export functionality
 st.divider()
-st.subheader("📤 Export Data")
+st.markdown("""
+### 📤 Export Data
+**Instructions:**
+- Export performance reports, trade data, or ML feedback data for further analysis.
+- Downloads are available in JSON or CSV format.
+""")
 
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    if st.button("📊 Export Performance Report"):
+    if st.button("📊 Export Performance Report", type="primary", use_container_width=True):
         try:
             stats = trading_engine.get_trade_statistics(account_type)
             report_data = {
@@ -806,14 +872,15 @@ with col1:
                 "💾 Download Report (JSON)",
                 data=pd.Series(report_data).to_json(indent=2),
                 file_name=f"performance_report_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json"
+                mime="application/json",
+                use_container_width=True
             )
         except Exception as e:
             logger.error(f"Error generating report: {e}")
             st.error(f"Error generating report: {e}")
 
 with col2:
-    if st.button("📈 Export Trade Data"):
+    if st.button("📈 Export Trade Data", type="primary", use_container_width=True):
         try:
             closed_trades = db_manager.get_trades(
                 status='closed',
@@ -841,16 +908,17 @@ with col2:
                     "💾 Download Trades (CSV)",
                     data=csv,
                     file_name=f"trades_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    use_container_width=True
                 )
             else:
-                st.info("No trade data to export")
+                st.info("📭 No trade data to export")
         except Exception as e:
             logger.error(f"Error exporting trades: {e}")
             st.error(f"Error exporting trades: {e}")
 
 with col3:
-    if st.button("🤖 Export ML Data"):
+    if st.button("🤖 Export ML Data", type="primary", use_container_width=True):
         try:
             feedback_data = db_manager.get_feedback(
                 limit=1000,
@@ -873,18 +941,23 @@ with col3:
                     "💾 Download ML Data (CSV)",
                     data=csv,
                     file_name=f"ml_feedback_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv"
+                    mime="text/csv",
+                    use_container_width=True
                 )
             else:
-                st.info("No ML feedback data to export")
+                st.info("📭 No ML feedback data to export")
         except Exception as e:
             logger.error(f"Error exporting ML data: {e}")
             st.error(f"Error exporting ML data: {e}")
 
-# Status footer
-st.divider()
 st.markdown(f"""
-**Status:** Exchange: {current_exchange.title()} | 
-Mode: {account_type.title()} | 
-Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-""")
+<div style='text-align: center; color: #666;'>
+    <strong>Status:</strong> Exchange: {current_exchange.title()} | 
+    Mode: {account_type.title()} | 
+    User: {username} | 
+    Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
+</div>
+""", unsafe_allow_html=True)
+
+if __name__ == "__main__":
+    pass

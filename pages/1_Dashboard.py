@@ -8,6 +8,7 @@ from db import db_manager
 from logging_config import get_trading_logger
 from utils import format_price, format_number
 import os
+import bcrypt
 
 # Initialize logger
 logger = get_trading_logger(__name__)
@@ -19,6 +20,14 @@ st.set_page_config(
     layout="wide"
 )
 
+# Header
+st.markdown("""
+<div style='padding: 1.5rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 1.5rem;'>
+    <h1 style='color: white; margin: 0;'>📈 Trading Dashboard</h1>
+    <p style='color: white; margin: 0.5rem 0 0 0;'>Monitor and manage your trading activities for {}</p>
+</div>
+""".format(st.session_state.get('user', {}).get('username', 'N/A')), unsafe_allow_html=True)
+
 def to_float(value):
     """Safely convert value to float"""
     try:
@@ -27,12 +36,12 @@ def to_float(value):
         return 0.0
 
 def authenticate_user(username: str, password: str) -> bool:
-    """Authenticate user against database"""
+    """Authenticate user against database with hashed password"""
     try:
         with db_manager.get_session() as session:
             from db import User
             user = session.query(User).filter_by(username=username).first()
-            if user and user.password_hash == password:  # Simple check - use proper hashing in production
+            if user and bcrypt.checkpw(password.encode('utf-8'), user.password_hash.encode('utf-8')):
                 st.session_state.user = user.to_dict()
                 st.session_state.authenticated = True
                 logger.info(f"User {username} authenticated successfully")
@@ -43,7 +52,7 @@ def authenticate_user(username: str, password: str) -> bool:
         return False
 
 def register_user(username: str, password: str) -> bool:
-    """Register new user"""
+    """Register new user with hashed password"""
     try:
         with db_manager.get_session() as session:
             from db import User
@@ -52,9 +61,11 @@ def register_user(username: str, password: str) -> bool:
                 logger.warning(f"User {username} already exists")
                 return False
             
+            hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            
             user = User(
                 username=username,
-                password_hash=password,  # In production, hash this properly
+                password_hash=hashed_password,
                 binance_api_key=None,
                 binance_api_secret=None,
                 bybit_api_key=None,
@@ -63,14 +74,13 @@ def register_user(username: str, password: str) -> bool:
             session.add(user)
             session.commit()
             
-            # Initialize wallet balances for new user
             from db import WalletBalance
             session.add(WalletBalance(
                 user_id=user.id, 
                 account_type="virtual", 
-                available=10000.0, 
+                available=1000.0, 
                 used=0.0, 
-                total=10000.0,
+                total=1000.0,
                 currency="USDT"
             ))
             session.add(WalletBalance(
@@ -95,15 +105,12 @@ def initialize_trading_engine(user_id: int):
         from multi_trading_engine import TradingEngine
         from settings import load_settings
         
-        # Load settings
         settings = load_settings()
         exchange = settings.get("EXCHANGE", "binance").lower()
         
-        # Initialize trading engine
         trading_engine = TradingEngine()
         trading_engine.switch_exchange(exchange)
         
-        # Store in session state
         st.session_state.trading_engine = trading_engine
         st.session_state.current_exchange = exchange
         st.session_state.user_id = user_id
@@ -119,15 +126,19 @@ def initialize_trading_engine(user_id: int):
 def main():
     """Main dashboard function"""
     
-    # Check authentication
     if not st.session_state.get('authenticated', False):
-        st.title("🔐 Dashboard Access")
-        st.markdown("**Please login or register to access the trading dashboard**")
+        st.markdown("### 🔐 Dashboard Access")
+        st.markdown("""
+        **Instructions:**
+        - **Login**: Enter your username and password to access your trading dashboard.
+        - **Register**: Create a new account if you don't have one. Ensure your password is at least 6 characters.
+        - **Note**: Virtual trading is enabled by default with a $1000 starting balance.
+        """)
         
         login_tab, register_tab = st.tabs(["Login", "Register"])
         
         with login_tab:
-            st.markdown("### Login to your account")
+            st.markdown("#### Login to Your Account")
             with st.form("login_form"):
                 username = st.text_input("Username", placeholder="Enter your username")
                 password = st.text_input("Password", type="password", placeholder="Enter your password")
@@ -145,7 +156,7 @@ def main():
                         st.error("Please enter both username and password")
         
         with register_tab:
-            st.markdown("### Create new account")
+            st.markdown("#### Create New Account")
             with st.form("register_form"):
                 new_username = st.text_input("New Username", placeholder="Choose a username")
                 new_password = st.text_input("New Password", type="password", placeholder="Choose a password")
@@ -168,17 +179,37 @@ def main():
         
         st.stop()
     
-    # User is authenticated, initialize components
     try:
         user_data = st.session_state.user
         user_id = user_data['id']
         username = user_data['username']
+        current_exchange = st.session_state.get('current_exchange', 'binance')
+        account_type = st.session_state.get('account_type', 'virtual')
         
-        # Welcome message
-        st.title(f"📈 Trading Dashboard")
-        st.markdown(f"👋 Welcome, **{username}**!")
+        st.markdown("### 📋 Quick Information")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f"""
+            <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #667eea;'>
+                <h4 style='margin: 0; color: #667eea;'>🏦 Exchange</h4>
+                <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{current_exchange.title()}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            st.markdown(f"""
+            <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #764ba2;'>
+                <h4 style='margin: 0; color: #764ba2;'>🎯 Mode</h4>
+                <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{account_type.title()}</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col3:
+            st.markdown(f"""
+            <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #10b981;'>
+                <h4 style='margin: 0; color: #10b981;'>👤 User</h4>
+                <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{username}</p>
+            </div>
+            """, unsafe_allow_html=True)
         
-        # Initialize trading engine if not done
         if not st.session_state.get('initialized', False):
             with st.spinner("Initializing trading engine..."):
                 if not initialize_trading_engine(user_id):
@@ -186,10 +217,7 @@ def main():
                     st.stop()
         
         trading_engine = st.session_state.trading_engine
-        current_exchange = st.session_state.get('current_exchange', 'binance')
-        account_type = st.session_state.get('account_type', 'virtual')
         
-        # Logout button
         col1, col2, col3 = st.columns([1, 1, 3])
         with col3:
             if st.button("🚪 Logout", type="secondary", use_container_width=False):
@@ -205,8 +233,13 @@ def main():
         st.error(f"Dashboard initialization error: {str(e)}")
         st.stop()
     
-    # Real-Time Price Ticker
-    st.subheader("📉 Real-Time Price Ticker")
+    st.markdown("""
+    ### 📉 Real-Time Price Ticker
+    **Instructions:**
+    - Select cryptocurrency symbols to track real-time prices.
+    - Choose an auto-refresh interval to update prices automatically.
+    - Monitor key metrics like wallet balance and trade statistics.
+    """)
     
     default_symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
     all_symbols = default_symbols + ["XRPUSDT", "ADAUSDT", "DOGEUSDT", "DOTUSDT"]
@@ -250,62 +283,33 @@ def main():
     
     st.divider()
     
-    # Main metrics row
-    st.subheader("📊 Key Metrics")
+    st.markdown("""
+    ### 📊 Key Metrics
+    **Instructions:**
+    - View your wallet balance, total P&L, win rate, and total trades.
+    - Use these metrics to assess your trading performance.
+    """)
+    
     col1, col2, col3, col4 = st.columns(4)
     
     try:
-        # Get wallet balance with user_id and exchange
         wallet = db_manager.get_wallet_balance(
-            balance_type=account_type, 
+            account_type=account_type, 
             user_id=user_id, 
             exchange=current_exchange
         )
-        balance = wallet.get('available', 10000.0 if account_type == 'virtual' else 0.0)
+        balance = wallet.get('available', 1000.0 if account_type == 'virtual' else 0.0)
         
-        # Get trade statistics
-        stats = trading_engine.get_trade_statistics(account_type)
-        
-        # Get recent signals and open trades
-        recent_signals = db_manager.get_signals(limit=24, exchange=current_exchange, user_id=user_id)
-        open_trades = db_manager.get_trades(
-            status='open', 
-            virtual=(account_type == 'virtual'), 
-            exchange=current_exchange, 
-            user_id=user_id
-        )
+        stats = trading_engine.get_trade_statistics(account_type) or {}
         
         with col1:
-            st.metric(
-                f"{account_type.title()} Balance",
-                format_price(balance),
-                delta=format_price(stats.get('total_pnl', 0)),
-                help="Total account balance including unrealized P&L"
-            )
-        
+            st.metric("Wallet Balance", format_price(balance))
         with col2:
-            st.metric(
-                "Open Positions",
-                len(open_trades),
-                delta=f"Max: {trading_engine.get_max_open_positions()}",
-                help="Number of currently open trades"
-            )
-        
+            st.metric("Total P&L", format_price(stats.get('total_pnl', 0)))
         with col3:
-            st.metric(
-                "Total Trades",
-                stats.get('total_trades', 0),
-                delta=f"{stats.get('successful_trades', 0)} profitable",
-                help="Total number of executed trades"
-            )
-        
+            st.metric("Total Trades", stats.get('total_trades', 0), delta=f"{stats.get('successful_trades', 0)} profitable")
         with col4:
-            st.metric(
-                "Win Rate",
-                f"{stats.get('win_rate', 0):.1f}%",
-                delta=f"Recent signals: {len(recent_signals)}",
-                help="Percentage of profitable trades"
-            )
+            st.metric("Win Rate", f"{stats.get('win_rate', 0):.1f}%", delta=f"Recent signals: {len(db_manager.get_signals(limit=10))}")
     
     except Exception as e:
         logger.error(f"Error loading dashboard metrics: {e}")
@@ -313,8 +317,13 @@ def main():
     
     st.divider()
     
-    # Trading Activity Overview
-    st.subheader("🔄 Trading Activity")
+    st.markdown("""
+    ### 🔄 Trading Activity
+    **Instructions:**
+    - **Recent Signals**: View the latest trading signals with details like symbol, side, and entry price.
+    - **Open Positions**: Monitor current open trades and their P&L.
+    - **Performance Charts**: Analyze cumulative P&L and trade distribution over a selected period.
+    """)
     
     tab1, tab2, tab3 = st.tabs(["Recent Signals", "Open Positions", "Performance Charts"])
     
@@ -358,12 +367,13 @@ def main():
     with tab2:
         st.write("**Current Open Positions**")
         try:
-            open_trades = db_manager.get_trades(
-                status='open', 
+            all_trades = db_manager.get_trades(
+                limit=1000,
                 virtual=(account_type == 'virtual'), 
                 exchange=current_exchange, 
                 user_id=user_id
             )
+            open_trades = [t for t in all_trades if t.status == 'open']
             
             if open_trades:
                 trade_data = []
@@ -429,12 +439,13 @@ def main():
                     key="perf_end_date"
                 )
             
-            all_closed_trades = db_manager.get_trades(
-                status='closed', 
+            all_trades = db_manager.get_trades(
+                limit=1000,
                 virtual=(account_type == 'virtual'), 
                 exchange=current_exchange, 
                 user_id=user_id
             )
+            all_closed_trades = [t for t in all_trades if t.status == 'closed']
             closed_trades = [
                 t for t in all_closed_trades
                 if t.updated_at and start_date <= t.updated_at.date() <= end_date
@@ -513,22 +524,21 @@ def main():
     
     st.divider()
     
-    # Auto-refresh logic
     if refresh_interval > 0:
         time.sleep(refresh_interval)
         st.rerun()
     
-    # Status footer
     trading_status = "🟢 Active" if hasattr(trading_engine, 'is_trading_enabled') and trading_engine.is_trading_enabled() else "🔴 Inactive"
     
     st.markdown(f"""
-    ---
-    **Status:** Exchange: {current_exchange.title()} | 
-    Trading: {trading_status} | 
-    Mode: {account_type.title()} | 
-    User: {username} | 
-    Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
-    """)
+    <div style='text-align: center; color: #666;'>
+        <strong>Status:</strong> Exchange: {current_exchange.title()} | 
+        Trading: {trading_status} | 
+        Mode: {account_type.title()} | 
+        User: {username} | 
+        Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}
+    </div>
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
