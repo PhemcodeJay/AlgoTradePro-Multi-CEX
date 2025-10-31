@@ -152,7 +152,7 @@ class WalletBalance(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, nullable=False, index=True)
     account_type = Column(String(20), nullable=False, index=True)
-    available = Column(Float, nullable=False, default=0.0)
+    available = Column(Float, nullable=False, default=100.0)
     used = Column(Float, nullable=False, default=0.0)
     total = Column(Float, nullable=False, default=0.0)
     currency = Column(String(10), default="USDT")

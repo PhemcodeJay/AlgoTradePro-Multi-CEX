@@ -481,7 +481,8 @@ def main():
                 st.metric("Open Positions", open_count_virtual, delta=f"Max: {max_open}")
 
             with col3:
-                st.metric("Virtual Balance", f"${dashboard_data_virtual['wallet']['available']:.2f}")
+                balance = dashboard_data_virtual['wallet'].get('available')
+                st.metric("Virtual Balance", f"${(balance if balance is not None and balance != '' else 100.0):.2f}")
 
             today_date = datetime.now(timezone.utc).date().isoformat()
             today_trades_virtual = [t for t in dashboard_data_virtual['closed_trades'] if t['created_at'].startswith(today_date)]

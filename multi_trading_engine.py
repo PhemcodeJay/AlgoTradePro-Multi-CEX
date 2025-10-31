@@ -4,6 +4,7 @@ import json
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple, Union
+
 import numpy as np
 import streamlit as st
 from db import DatabaseManager, Trade, WalletBalance, User
@@ -11,20 +12,19 @@ from settings import load_settings
 from logging_config import get_trading_logger
 from exceptions import (
     TradingException, APIException, APIRateLimitException,
-    APIAuthenticationException, APITimeoutException, create_error_context
+    APIAuthenticationException, APITimeoutException
 )
 from utils import round_to_precision
 
 logger = get_trading_logger('engine')
 
 
-# ———————————————————————————————————————
-# Unified Trading Engine
-# ———————————————————————————————————————
 class TradingEngine:
-    def __init__(self, user_id: int, exchange: str = "bybit", account_type: str = "virtual"):
+    def __init__(self, user_id: int, exchange: str = "binance", account_type: str = "virtual"):
         self.user_id = user_id
         self.exchange = exchange.lower()
+        self._settings: Dict[str, Any] = {}
+        self._stats: Dict[str, Any] = {}
         self.account_type = account_type.lower()
         self.logger = get_trading_logger('engine')
         self.api_keys: Dict[str, Any] = {}
@@ -34,7 +34,7 @@ class TradingEngine:
         self.bybit_api_key: Optional[str] = None
         self.bybit_api_secret: Optional[str] = None
 
-        # INIT DB FIRST
+        # DB
         self.db = DatabaseManager()
         self._load_api_keys()
 
@@ -51,7 +51,9 @@ class TradingEngine:
         self._emergency_stop = False
         self._consecutive_failures = 0
         self._daily_pnl = 0.0
-        self._daily_reset_time = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        self._daily_reset_time = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
 
         self.max_position_size = float(self.settings.get("MAX_POSITION_SIZE", 10000.0))
         self.max_open_positions = int(self.settings.get("MAX_OPEN_POSITIONS", 10))
@@ -64,11 +66,10 @@ class TradingEngine:
 
         self._initialize_wallets()
 
-        logger.info("TradingEngine initialized", extra={
-            "user_id": self.user_id,
-            "exchange": self.exchange,
-            "account_type": self.account_type,
-        })
+        logger.info(
+            "TradingEngine initialized",
+            extra={"user_id": self.user_id, "exchange": self.exchange, "account_type": self.account_type},
+        )
 
     # ----------------------------------------------------------------------
     # 1. Load API keys from the `users` table
@@ -87,15 +88,52 @@ class TradingEngine:
             self.logger.error(f"Failed to load API keys: {e}")
 
     # ----------------------------------------------------------------------
-    # 2. Settings
+    # 2. Public settings accessor (required by AutomatedTrader)
+    # ----------------------------------------------------------------------
+    def get_settings(self) -> dict:
+        """Return a **copy** of the current engine settings."""
+        return self._settings.copy()
+
+    # ----------------------------------------------------------------------
+    # 3. Trade statistics (used by the dashboard)
+    # ----------------------------------------------------------------------
+    def get_trade_statistics(self, mode: str = "virtual") -> dict:
+        """
+        Return aggregated stats for *virtual* or *real* trades.
+        Keys: total_trades, win_rate (%), total_pnl
+        """
+        virtual = mode == "virtual"
+        trades = self.db.get_trades(
+            virtual=virtual,
+            exchange=self.exchange,
+            user_id=self.user_id,
+            limit=10_000,
+        ) or []
+
+        closed = [t for t in trades if getattr(t, "status", "") == "closed"]
+        total = len(closed)
+        wins = sum(1 for t in closed if float(getattr(t, "pnl", 0) or 0) > 0)
+        win_rate = (wins / total * 100) if total else 0.0
+        pnl = sum(float(getattr(t, "pnl", 0) or 0) for t in closed)
+
+        return {
+            "total_trades": total,
+            "win_rate": round(win_rate, 2),
+            "total_pnl": round(pnl, 2),
+        }
+
+    # ----------------------------------------------------------------------
+    # 4. Settings loader
     # ----------------------------------------------------------------------
     def _load_settings(self) -> Dict[str, Any]:
         base = load_settings(user_id=self.user_id) or {}
         exchange_settings = base.get(self.exchange, {})
-        return {**base, **exchange_settings}
+        merged = {**base, **exchange_settings}
+        self._settings = merged
+        return merged
 
     # ----------------------------------------------------------------------
-    # 3. Client initialisation (called from switch_exchange)
+    # 5. Client initialisation
     # ----------------------------------------------------------------------
     def _init_client(self):
         if self.exchange == "bybit":
@@ -108,7 +146,7 @@ class TradingEngine:
             raise TradingException(f"Unsupported exchange: {self.exchange}")
 
     # ----------------------------------------------------------------------
-    # 4. Update API credentials (Settings page → instant reload)
+    # 6. Update API credentials (Settings page)
     # ----------------------------------------------------------------------
     def update_api_credentials(self, exchange: str, api_key: str, api_secret: str):
         exchange = exchange.lower()
@@ -129,7 +167,7 @@ class TradingEngine:
             self.switch_exchange(exchange)
 
     # ----------------------------------------------------------------------
-    # 5. Switch exchange
+    # 7. Switch exchange
     # ----------------------------------------------------------------------
     def switch_exchange(self, exchange: str):
         exchange = exchange.lower()
@@ -158,14 +196,14 @@ class TradingEngine:
         self.reload_settings()
 
     # ----------------------------------------------------------------------
-    # 6. Reload settings (after exchange or key change)
+    # 8. Reload settings after exchange / key change
     # ----------------------------------------------------------------------
     def reload_settings(self):
         self.settings = self._load_settings()
         self.exchange_name = self.exchange
 
     # ----------------------------------------------------------------------
-    # 7. Account type switch
+    # 9. Account type switch
     # ----------------------------------------------------------------------
     def set_account_type(self, account_type: str):
         account_type = account_type.lower()
@@ -191,10 +229,11 @@ class TradingEngine:
         w = self.db.get_wallet_balance(self.account_type, self.user_id, self.exchange)
         if not w:
             return {"total": 0.0, "available": 0.0, "used": 0.0}
+        # ALWAYS return a plain dict – dashboard expects this
         return {
-            "total": float(w.total or 0.0),
-            "available": float(w.available or 0.0),
-            "used": float(w.used or 0.0),
+            "total": float(getattr(w, "total", 0.0) or 0.0),
+            "available": float(getattr(w, "available", 0.0) or 0.0),
+            "used": float(getattr(w, "used", 0.0) or 0.0),
         }
 
     def _update_wallet(
