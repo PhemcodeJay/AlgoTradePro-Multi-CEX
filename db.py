@@ -3,8 +3,8 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any, Union
 from sqlalchemy import Index, create_engine, Column, Integer, String, Float, Boolean, DateTime, Text, JSON
-from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, scoped_session
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.exc import SQLAlchemyError
 from logging_config import get_trading_logger
 from contextlib import contextmanager
@@ -36,6 +36,7 @@ class User(Base):
     binance_api_secret = Column(String(100), nullable=True)
     bybit_api_key = Column(String(100), nullable=True)
     bybit_api_secret = Column(String(100), nullable=True)
+    default_exchange  = Column(String(20), nullable=False, default="binance")
     created_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc))
 
     def to_dict(self) -> Dict[str, Any]:
@@ -46,6 +47,7 @@ class User(Base):
             "binance_api_secret": self.binance_api_secret,
             "bybit_api_key": self.bybit_api_key,
             "bybit_api_secret": self.bybit_api_secret,
+            "default_exchange": self.default_exchange,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
     

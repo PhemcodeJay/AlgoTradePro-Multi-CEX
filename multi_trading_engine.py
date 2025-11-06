@@ -499,17 +499,30 @@ class TradingEngine:
         )
 
     def sync_real_positions(self) -> bool:
-        if self.account_type != "real" or self.exchange != "bybit":
+        if self.account_type != "real":
             return False
         try:
-            positions = self.client._make_request(
-                "GET", "/v5/position/list", {"category": "linear", "settleCoin": "USDT"}
-            )["list"]
+            if self.exchange == "bybit":
+                positions = self.client._make_request(
+                    "GET", "/v5/position/list", {"category": "linear", "settleCoin": "USDT"}
+                )["list"]
+            elif self.exchange == "binance":
+                positions = self.client._make_request(  # FIX: Added Binance support
+                    "GET", "/fapi/v2/positionRisk", signed=True
+                )
+            else:
+                return False
+            
             for pos in positions:
-                if float(pos.get("size", 0)) <= 0:
+                size = float(pos.get("size") or pos.get("positionAmt", 0))
+                if size == 0:
                     continue
-                # Add sync logic here if needed
-                pass
+                # Sync logic: Update DB trades with current PnL, etc.
+                symbol = pos.get("symbol")
+                trade = self.db.get_trade_by_position(symbol, self.exchange, virtual=False)
+                if trade:
+                    pnl = float(pos.get("unrealisedPnl") or pos.get("unRealizedProfit", 0))
+                    self.db.update_trade(trade.id, {"pnl": pnl})
             return True
         except Exception as e:
             logger.error(f"Sync failed: {e}")

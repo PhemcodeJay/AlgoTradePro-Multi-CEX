@@ -5,15 +5,20 @@ from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 
+# === CORRECT IMPORTS FROM indicators.py ===
 from indicators import (
-    analyze_single_symbol, fetch_klines, scan_multiple_symbols,
-    get_top_symbols, calculate_indicators
+    analyze_symbol,      # ← Uses the real one from indicators.py
+    fetch_klines,
+    scan_symbols,
+    get_top_symbols,
+    calculate_indicators
 )
+
 from ml import MLFilter
 from notifications import send_all_notifications
 from logging_config import get_logger
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import db as db_manager
 
 # Import clients
@@ -24,80 +29,89 @@ logger = get_logger(__name__)
 
 TRADING_MODE = os.getenv("TRADING_MODE", "virtual").lower()
 
+
 # --------------------------------------------------------------------------- #
-# Helper: Get correct client instance
+# Helper: Get client instance
 # --------------------------------------------------------------------------- #
 def get_client(exchange: str):
-    """Factory to get BinanceClient or BybitClient"""
-    if exchange.lower() == "binance":
+    exchange = exchange.lower()
+    if exchange == "binance":
         return BinanceClient()
-    elif exchange.lower() == "bybit":
+    elif exchange == "bybit":
         return BybitClient()
     else:
         raise ValueError(f"Unsupported exchange: {exchange}")
 
+
 # --------------------------------------------------------------------------- #
-# Core: Generate signals for any exchange
+# Core: Generate signals
 # --------------------------------------------------------------------------- #
 def generate_signals(
     exchange: str,
     timeframe: str = '1h',
-    max_symbols: int = 10,
+    max_symbols: int = 50,
     user_id: Optional[int] = None
 ) -> List[Dict]:
-    """
-    Generate high-confidence trading signals for Binance or Bybit.
-    """
     exchange = exchange.lower()
     if exchange not in ("binance", "bybit"):
         logger.error(f"Invalid exchange: {exchange}")
         return []
 
     try:
-        logger.info(f"Generating signals for {exchange.upper()} | timeframe={timeframe} | max_symbols={max_symbols}")
+        logger.info(f"Generating signals | {exchange.upper()} | {timeframe} | max={max_symbols}")
 
         # 1. Get top symbols
-        symbols = get_top_symbols(exchange, max_symbols * 2)  # fetch extra for filtering
+        symbols = get_top_symbols(exchange, max_symbols * 2)
         if not symbols:
-            logger.warning(f"No symbols returned for {exchange}")
+            logger.warning(f"No symbols for {exchange}")
             return []
 
-        # 2. Analyze in parallel
+        # 2. Parallel analysis
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_symbol = {
-                executor.submit(analyze_single_symbol, exchange, sym, timeframe): sym
+                executor.submit(analyze_symbol, exchange, sym, timeframe): sym
                 for sym in symbols
             }
             raw_results = []
             for future in as_completed(future_to_symbol):
+                symbol = future_to_symbol[future]
                 try:
                     result = future.result(timeout=30)
                     if result and result.get('side') != 'HOLD':
                         raw_results.append(result)
+                except TimeoutError:
+                    logger.warning(f"Timeout: {symbol}")
                 except Exception as e:
-                    symbol = future_to_symbol[future]
-                    logger.error(f"Error analyzing {symbol}: {e}")
+                    logger.error(f"Analysis failed {symbol}: {e}")
 
         if not raw_results:
-            logger.info(f"No valid signals generated for {exchange}")
+            logger.info("No signals generated.")
             return []
 
-        # 3. Apply ML Filter (with exchange & user context)
+        # 3. ML Filter
         try:
             ml_filter = MLFilter(user_id=user_id, exchange=exchange)
             filtered_signals = ml_filter.filter_signals(raw_results)
         except Exception as e:
-            logger.warning(f"ML filter failed, skipping: {e}")
+            logger.warning(f"ML filter failed: {e} → using raw")
             filtered_signals = raw_results
 
-        # 4. Sort by score & limit
+        # 4. Sort & limit
         sorted_signals = sorted(
             filtered_signals,
             key=lambda x: x.get('score', 0),
             reverse=True
         )[:max_symbols]
 
-        # 5. Save to DB
+        # 5. Ensure required fields
+        for sig in sorted_signals:
+            sig.setdefault('signal_type', 'rsi_sma_vol')
+            sig.setdefault('trail', 0.0)
+            sig.setdefault('liquidation', 0.0)
+            sig.setdefault('margin_usdt', 10.0)
+            sig.setdefault('indicators', {})
+
+        # 6. Save to DB
         saved = 0
         for sig in sorted_signals:
             db_signal = {
@@ -124,126 +138,125 @@ def generate_signals(
             if db_manager.add_signal(db_signal):
                 saved += 1
 
-        logger.info(f"Generated {len(sorted_signals)} signals | Saved {saved} to DB | Exchange: {exchange.upper()}")
+        logger.info(f"Generated {len(sorted_signals)} | Saved {saved} | {exchange.upper()}")
         return sorted_signals
 
     except Exception as e:
-        logger.error(f"Critical error in generate_signals({exchange}): {e}", exc_info=True)
+        logger.error(f"generate_signals failed: {e}", exc_info=True)
         return []
 
 
 # --------------------------------------------------------------------------- #
-# Utility: Convert numpy types to native Python
+# Utility: Convert numpy types
 # --------------------------------------------------------------------------- #
 def convert_np_types(data: Any) -> Any:
     if isinstance(data, dict):
         return {k: convert_np_types(v) for k, v in data.items()}
     elif isinstance(data, list):
         return [convert_np_types(item) for item in data]
-    elif isinstance(data, np.float64):
+    elif isinstance(data, (np.float64, np.float32, np.float_)):
         return float(data)
-    elif isinstance(data, np.int64):
+    elif isinstance(data, (np.int64, np.int32, np.int_)):
         return int(data)
+    elif isinstance(data, np.ndarray):
+        return data.tolist()
     return data
 
 
 # --------------------------------------------------------------------------- #
-# Summary: Recent signal stats
+# Summary: Signal stats
 # --------------------------------------------------------------------------- #
 def get_signal_summary(exchange: str, user_id: Optional[int] = None) -> Dict[str, Any]:
     try:
         signals = db_manager.get_signals(limit=100, exchange=exchange.lower(), user_id=user_id)
-        buy = len([s for s in signals if s.side.lower() == 'buy'])
-        sell = len([s for s in signals if s.side.lower() == 'sell'])
-        last = max((s.created_at for s in signals), default=None)
+        buy = len([s for s in signals if getattr(s, 'side', '').lower() == 'buy'])
+        sell = len([s for s in signals if getattr(s, 'side', '').lower() == 'sell'])
+        last = None
+        if signals:
+            times = [s.created_at for s in signals if hasattr(s, 'created_at') and s.created_at]
+            if times:
+                last = max(datetime.fromisoformat(t.replace('Z', '+00:00')) for t in times)
         return {
-            'exchange': exchange,
+            'exchange': exchange.lower(),
             'total_signals': len(signals),
             'buy_signals': buy,
             'sell_signals': sell,
             'last_signal_time': last.isoformat() if last else None
         }
     except Exception as e:
-        logger.error(f"Error in get_signal_summary: {e}")
-        return {'exchange': exchange, 'total_signals': 0, 'buy_signals': 0, 'sell_signals': 0, 'last_signal_time': None}
-
+        logger.error(f"get_signal_summary error: {e}")
+        return {
+            'exchange': exchange.lower(),
+            'total_signals': 0,
+            'buy_signals': 0,
+            'sell_signals': 0,
+            'last_signal_time': None
+        }
 
 # --------------------------------------------------------------------------- #
-# Optional: Manual single-symbol analysis (for testing)
+# Core: Analyze a single symbol
 # --------------------------------------------------------------------------- #
-def analyze_symbol(
+def analyze_single_symbol(
     exchange: str,
     symbol: str,
     timeframe: str = '1h'
 ) -> Optional[Dict]:
-    """Analyze one symbol on Binance or Bybit"""
+    """
+    Analyze a single symbol and return a signal (or None).
+    Reuses the same logic as generate_signals but for one symbol.
+    """
+    exchange = exchange.lower()
+    client = get_client(exchange)
+
     try:
-        df = fetch_klines(exchange, symbol, timeframe, limit=200)
-        if df is None or len(df) < 200:
-            logger.warning(f"Insufficient data for {symbol} on {exchange}")
+        logger.info(f"Analyzing single symbol: {symbol} | {exchange} | {timeframe}")
+
+        # Fetch klines
+        df = fetch_klines(exchange, symbol, timeframe, limit=100)
+        if df is None or df.empty:
+            logger.warning(f"No data for {symbol}")
             return None
 
-        df = calculate_indicators(df)
-        if df['close'].isna().any():
+        # Calculate indicators
+        indicators = calculate_indicators(df)
+        if indicators is None:
             return None
 
-        latest = df.iloc[-1]
-        signal = {
-            'symbol': symbol,
-            'exchange': exchange,
-            'interval': timeframe,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'price': float(latest['close']),
-            'indicators': {
-                'rsi': float(latest['rsi']),
-                'sma20': float(latest['sma20']),
-                'sma50': float(latest['sma50']),
-                'atr': float(latest['atr'])
-            }
-        }
-
-        # Simple logic (can be expanded)
-        if latest['rsi'] > 70 and latest['sma20'] < latest['sma50']:
-            signal.update({'side': 'sell', 'signal_type': 'bearish_rsi_sma'})
-        elif latest['rsi'] < 30 and latest['sma20'] > latest['sma50']:
-            signal.update({'side': 'buy', 'signal_type': 'bullish_rsi_sma'})
-        else:
+        # Use analyze_symbol logic (already imported)
+        result = analyze_symbol(exchange, symbol, timeframe)
+        if not result or result.get('side') == 'HOLD':
             return None
 
-        signal['score'] = 0.7 if signal['side'] == 'buy' and latest['rsi'] < 25 else 0.6
-        signal['score'] = 0.7 if signal['side'] == 'sell' and latest['rsi'] > 75 else signal['score']
+        # Ensure required fields
+        result.setdefault('signal_type', 'rsi_sma_vol')
+        result.setdefault('trail', 0.0)
+        result.setdefault('liquidation', 0.0)
+        result.setdefault('margin_usdt', 10.0)
+        result.setdefault('indicators', indicators)
 
-        # Add SL/TP
-        price = signal['price']
-        atr = latest['atr']
-        if signal['side'] == 'buy':
-            signal['sl'] = price - 2 * atr
-            signal['tp'] = price + 3 * atr
-        else:
-            signal['sl'] = price + 2 * atr
-            signal['tp'] = price - 3 * atr
+        # Convert numpy types
+        result['indicators'] = convert_np_types(result['indicators'])
 
-        signal['leverage'] = 10
-        signal['margin_usdt'] = 3.0
+        logger.info(f"Signal generated: {symbol} → {result['side']}")
+        return result
 
-        return signal
     except Exception as e:
-        logger.error(f"Error analyzing {symbol} on {exchange}: {e}")
+        logger.error(f"analyze_single_symbol failed for {symbol}: {e}", exc_info=True)
         return None
-
-
+    
 # --------------------------------------------------------------------------- #
-# Main entry (for testing)
+# Main: Test
 # --------------------------------------------------------------------------- #
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # Test both exchanges
     for exch in ["binance", "bybit"]:
         logger.info(f"\n{'='*60}\n TESTING {exch.upper()} \n{'='*60}")
-        signals = generate_signals(exchange=exch, timeframe="60", max_symbols=3)
+        signals = generate_signals(exchange=exch, timeframe="1h", max_symbols=3)
         summary = get_signal_summary(exch)
 
-        logger.info(f"Signal Summary ({exch}): {summary}")
+        logger.info(f"Summary ({exch}): {summary}")
         if signals:
+            top = signals[0]
+            logger.info(f"TOP: {top['symbol']} → {top['side']} | Score: {top['score']}")
             send_all_notifications(signals)
