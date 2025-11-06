@@ -4,7 +4,7 @@ import plotly.express as px
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Union
 from db import db_manager, Signal
-from signal_generator import analyze_single_symbol, get_signal_summary, generate_signals
+from signal_generator import analyze_single_symbol, get_signal_summary, generate_signals, convert_np_types
 from ml import MLFilter
 from logging_config import get_trading_logger
 from notifications import send_all_notifications
@@ -30,15 +30,7 @@ st.markdown("""
 </div>
 """.format(st.session_state.get('user', {}).get('username', 'N/A')), unsafe_allow_html=True)
 
-# Utility function
-def convert_np_types(data: Any) -> Any:
-    if isinstance(data, dict):
-        return {k: convert_np_types(v) for k, v in data.items()}
-    elif isinstance(data, list):
-        return [convert_np_types(item) for item in data]
-    elif isinstance(data, np.float64):
-        return float(data)
-    return data
+
 
 def authenticate_user(username: str, password: str) -> bool:
     """Authenticate user against database with hashed password"""

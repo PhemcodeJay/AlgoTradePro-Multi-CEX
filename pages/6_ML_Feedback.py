@@ -184,7 +184,8 @@ st.markdown("""
 """)
 
 try:
-    ml_filter = MLFilter(user_id=user_id, exchange=current_exchange)
+    ml_filter = MLFilter(user_id=st.session_state.user_id, exchange=current_exchange)
+    
     
     col1, col2, col3, col4 = st.columns(4)
     
