@@ -184,7 +184,7 @@ st.markdown("""
 """)
 
 try:
-    ml_filter = MLFilter(user_id=st.session_state.user_id, exchange=current_exchange)
+    ml_filter = MLFilter(user_id=str(user_id), exchange=current_exchange)
     
     
     col1, col2, col3, col4 = st.columns(4)
@@ -318,13 +318,14 @@ def get_feature_suggestion(feature: str) -> str:
 
 # ML Management Tabs
 st.markdown("### ⚙️ Manage AI Analysis")
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+_tabs = st.tabs([
     "🏋️ Model Training",
     "📈 Feedback Analysis",
     "🎯 Feature Importance",
     "📊 Model Performance",
     "✏️ Manual Feedback"
 ])
+tab1, tab2, tab3, tab4, tab5 = _tabs
 
 with tab1:
     st.markdown("""
@@ -375,7 +376,6 @@ with tab1:
                 
             else:
                 st.info("No valid trades available for training")
-        
         except Exception as e:
             logger.error(f"Error loading training data: {e}")
             st.error(f"Error loading training data: {e}")
@@ -411,14 +411,13 @@ with tab1:
             st.markdown(f"- **Exchange:** {current_exchange.title()}")
         
         if st.button("🗑️ Reset Model", type="secondary", use_container_width=True):
-            if st.button("⚠️ Confirm Reset", key="confirm_model_reset", type="secondary", use_container_width=True):
+            if st.button("⚠️ Confirm Reset", key="confirm_reset", type="secondary", use_container_width=True):
                 try:
                     if os.path.exists(ml_filter.model_path):
                         os.remove(ml_filter.model_path)
                     if os.path.exists(ml_filter.scaler_path):
                         os.remove(ml_filter.scaler_path)
                     ml_filter.model = None
-                    ml_filter.scaler = None
                     st.success("✅ Model reset successfully!")
                     st.session_state.last_updated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                     st.rerun()
@@ -430,133 +429,64 @@ with tab2:
     st.markdown("""
     ### 📈 Feedback Analysis
     **Instructions:**
-    - Review feedback trends, symbol performance, and recent feedback.
-    - Use charts and tables to identify patterns in model performance.
+    - Review recent feedback entries and their distribution.
+    - Use the table to filter and sort feedback data.
+    - Analyze patterns in profitable vs unprofitable trades.
     """)
     
     try:
-        feedback_data = db_manager.get_feedback(limit=500, exchange=current_exchange, user_id=user_id)
-        
+        feedback_data = db_manager.get_feedback(limit=100, exchange=current_exchange, user_id=user_id)
         if feedback_data:
             feedback_list = [f.to_dict() for f in feedback_data]
-            col1, col2, col3 = st.columns(3)
+            
+            df_feedback = pd.DataFrame(feedback_list)
+            df_feedback['timestamp'] = pd.to_datetime(df_feedback['timestamp'])
+            df_feedback = df_feedback.sort_values('timestamp', ascending=False)
+            
+            col1, col2 = st.columns([1, 2])
             
             with col1:
-                positive_count = len([f for f in feedback_list if f['outcome']])
-                st.markdown(f"""
-                <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #10b981;'>
-                    <h4 style='margin: 0; color: #10b981;'>✅ Positive Outcomes</h4>
-                    <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{positive_count}</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col2:
-                negative_count = len([f for f in feedback_list if not f['outcome']])
-                st.markdown(f"""
-                <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #ef4444;'>
-                    <h4 style='margin: 0; color: #ef4444;'>❌ Negative Outcomes</h4>
-                    <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{negative_count}</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            with col3:
-                accuracy = (positive_count / len(feedback_list)) * 100 if feedback_list else 0
-                st.markdown(f"""
-                <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #f59e0b;'>
-                    <h4 style='margin: 0; color: #f59e0b;'>📊 Overall Accuracy</h4>
-                    <p style='margin: 0.5rem 0 0 0; font-size: 1.2rem;'>{accuracy:.1f}%</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            st.markdown("**Feedback Trends**")
-            feedback_df = pd.DataFrame([{
-                'Date': (datetime.fromisoformat(f['timestamp']) if isinstance(f['timestamp'], str) else f['timestamp']).date(),
-                'Outcome': f['outcome'],
-                'Symbol': f['symbol'],
-                'Exchange': f['exchange'],
-                'Profit_Loss': f['profit_loss'] or 0
-            } for f in feedback_list])
-            
-            daily_feedback = feedback_df.groupby('Date').agg({
-                'Outcome': ['count', 'mean'],
-                'Profit_Loss': 'sum'
-            }).round(3)
-            
-            daily_feedback.columns = ['Total_Feedback', 'Success_Rate', 'Total_PnL']
-            daily_feedback = daily_feedback.reset_index()
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                fig_feedback_count = px.bar(
-                    daily_feedback,
-                    x='Date',
-                    y='Total_Feedback',
-                    title="Daily Feedback Count",
-                    color='Total_Feedback',
-                    color_continuous_scale='Blues'
+                st.markdown("**Feedback Distribution**")
+                fig_outcome = px.pie(
+                    df_feedback, 
+                    names='outcome', 
+                    title='Outcome Distribution',
+                    color='outcome',
+                    color_discrete_map={True: 'green', False: 'red'}
                 )
-                st.plotly_chart(fig_feedback_count, use_container_width=True)
-            
-            with col2:
-                fig_success_rate = px.line(
-                    daily_feedback,
-                    x='Date',
-                    y='Success_Rate',
-                    title="Daily Success Rate",
-                    markers=True
+                fig_outcome.update_layout(height=300)
+                st.plotly_chart(fig_outcome, use_container_width=True)
+                
+                fig_symbols = px.bar(
+                    df_feedback['symbol'].value_counts().reset_index(),
+                    x='symbol',
+                    y='count',
+                    title='Feedback by Symbol'
                 )
-                fig_success_rate.add_hline(y=0.5, line_dash="dash", line_color="red", 
-                                         annotation_text="Random Baseline (50%)")
-                st.plotly_chart(fig_success_rate, use_container_width=True)
-            
-            st.markdown("**Performance by Symbol**")
-            symbol_stats = feedback_df.groupby('Symbol').agg({
-                'Outcome': ['count', 'mean'],
-                'Profit_Loss': 'sum'
-            }).round(3)
-            
-            symbol_stats.columns = ['Feedback_Count', 'Success_Rate', 'Total_PnL']
-            symbol_stats = symbol_stats.reset_index()
-            symbol_stats = symbol_stats.sort_values('Total_PnL', ascending=False)
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("**Top Performers**")
-                top_performers = symbol_stats.head(5)
-                st.dataframe(top_performers, use_container_width=True)
+                fig_symbols.update_layout(height=300)
+                st.plotly_chart(fig_symbols, use_container_width=True)
             
             with col2:
-                st.markdown("**Bottom Performers**")
-                bottom_performers = symbol_stats.tail(5)
-                st.dataframe(bottom_performers, use_container_width=True)
-            
-            st.markdown("**Recent Feedback (Last 20)**")
-            recent_feedback_data = []
-            for feedback in feedback_list[:20]:
-                timestamp = datetime.fromisoformat(feedback['timestamp']) if isinstance(feedback['timestamp'], str) else feedback['timestamp']
-                recent_feedback_data.append({
-                    'Date': timestamp.strftime('%Y-%m-%d %H:%M'),
-                    'Symbol': feedback['symbol'],
-                    'Outcome': '✅ Success' if feedback['outcome'] else '❌ Failure',
-                    'P&L': f"${feedback['profit_loss']:.2f}" if feedback['profit_loss'] is not None else "N/A",
-                    'Exchange': feedback['exchange']
-                })
-            
-            df_recent = pd.DataFrame(recent_feedback_data)
-            def color_outcome(val):
-                if '✅' in str(val):
-                    return 'background-color: rgba(0, 255, 0, 0.1)'
-                elif '❌' in str(val):
-                    return 'background-color: rgba(255, 0, 0, 0.1)'
-                return ''
-            
-            styled_df = df_recent.style.applymap(color_outcome, subset=['Outcome'])
-            st.dataframe(styled_df, use_container_width=True)
+                st.markdown("**Recent Feedback Entries**")
+                show_columns = ['symbol', 'outcome', 'profit_loss', 'timestamp']
+                df_display = df_feedback[show_columns].copy()
+                df_display['outcome'] = df_display['outcome'].map({True: '✅ Success', False: '❌ Failure'})
+                df_display['profit_loss'] = df_display['profit_loss'].apply(lambda x: f"${x:.2f}")
+                df_display['timestamp'] = df_display['timestamp'].dt.strftime('%Y-%m-%d %H:%M')
+                st.dataframe(
+                    df_display,
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                st.markdown("**Average Metrics**")
+                avg_profit = df_feedback[df_feedback['outcome']]['profit_loss'].mean()
+                avg_loss = df_feedback[~df_feedback['outcome']]['profit_loss'].mean()
+                st.metric("Avg Profit (Success)", f"${avg_profit:.2f}" if not np.isnan(avg_profit) else "N/A")
+                st.metric("Avg Loss (Failure)", f"${avg_loss:.2f}" if not np.isnan(avg_loss) else "N/A")
         
         else:
-            st.info("No feedback data available")
+            st.info("No feedback data available. Add feedback or analyze trades to generate data.")
     
     except Exception as e:
         logger.error(f"Error in feedback analysis: {e}")
@@ -567,99 +497,68 @@ with tab3:
     ### 🎯 Feature Importance Analysis
     **Instructions:**
     - Review the importance of each feature in the ML model.
-    - Analyze feature performance and get suggestions for improvement.
-    - Ensure a trained model exists for accurate analysis.
+    - Use performance metrics to understand feature impact.
+    - Implement suggestions to improve model features.
     """)
     
-    try:
-        if ml_filter.model is not None:
-            importance = ml_filter.get_feature_importance()
-            if importance:
-                features = list(importance.keys())
-                importances = list(importance.values())
+    if ml_filter.model is not None:
+        try:
+            feature_importance = ml_filter.get_feature_importance()
+            if feature_importance:
+                df_importance = pd.DataFrame({
+                    'Feature': list(feature_importance.keys()),
+                    'Importance': list(feature_importance.values())
+                }).sort_values('Importance', ascending=False)
                 
-                fig_importance = px.bar(
-                    x=importances,
-                    y=features,
-                    orientation='h',
-                    title="Feature Importance in ML Model",
-                    color=importances,
-                    color_continuous_scale='Viridis'
-                )
-                fig_importance.update_layout(height=500, xaxis_title="Importance")
-                st.plotly_chart(fig_importance, use_container_width=True)
+                col1, col2 = st.columns([1, 1])
                 
-                st.markdown("**Feature Details**")
-                importance_data = []
-                for i, (feature, imp) in enumerate(importance.items()):
-                    importance_data.append({
-                        'Rank': i + 1,
-                        'Feature': feature.upper(),
-                        'Importance': f"{imp:.4f}",
-                        'Percentage': f"{imp / sum(importances) * 100:.1f}%",
-                        'Description': get_feature_description(feature),
-                        'Performance': get_feature_performance(feature)
-                    })
+                with col1:
+                    fig_importance = px.bar(
+                        df_importance,
+                        x='Importance',
+                        y='Feature',
+                        orientation='h',
+                        title='Feature Importance',
+                        color='Importance',
+                        color_continuous_scale='Blues'
+                    )
+                    fig_importance.update_layout(yaxis={'categoryorder':'total ascending'})
+                    st.plotly_chart(fig_importance, use_container_width=True)
                 
-                df_importance = pd.DataFrame(importance_data)
-                st.dataframe(df_importance, use_container_width=True)
-                
-                st.markdown("**Feature Analysis**")
-                trades = db_manager.get_trades(limit=100, exchange=current_exchange, user_id=user_id, virtual=(account_type == 'virtual'))
-                trades_list = [t.to_dict() for t in trades]
-                trades_with_indicators = [t for t in trades_list if t['indicators']]
-                
-                if len(trades_with_indicators) > 10:
-                    feature_data = []
-                    for trade in trades_with_indicators:
-                        indicators = trade['indicators']
-                        row = {'outcome': 1 if (trade['pnl'] or 0) > 0 else 0}
-                        for feature in ml_filter.feature_columns:
-                            row[feature] = indicators.get(feature, 0)
-                        feature_data.append(row)
-                    
-                    df_features = pd.DataFrame(feature_data)
-                    profitable_stats = df_features[df_features['outcome'] == 1].describe()
-                    unprofitable_stats = df_features[df_features['outcome'] == 0].describe()
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown("**Profitable Trades Stats**")
-                        st.dataframe(profitable_stats.round(4), height=300)
-                    with col2:
-                        st.markdown("**Unprofitable Trades Stats**")
-                        st.dataframe(unprofitable_stats.round(4), height=300)
-                
-                st.markdown("**Feature Suggestions**")
-                top_features = list(importance.keys())[:3]
-                for feature in top_features:
-                    st.markdown(f"- **{feature.upper()}:** {get_feature_suggestion(feature)}")
-            
+                with col2:
+                    st.markdown("**Feature Details**")
+                    for _, row in df_importance.iterrows():
+                        with st.expander(f"📊 {row['Feature']} ({row['Importance']:.3f})"):
+                            st.markdown(f"**Description:** {get_feature_description(row['Feature'])}")
+                            st.markdown(f"**Performance:** {get_feature_performance(row['Feature'])}")
+                            st.markdown(f"**Suggestion:** {get_feature_suggestion(row['Feature'])}")
             else:
                 st.warning("No feature importance data available")
         
-        else:
-            st.warning("No ML model loaded. Train a model first.")
-    
-    except Exception as e:
-        logger.error(f"Error in feature importance analysis: {e}")
-        st.error(f"Error in feature importance analysis: {e}")
+        except Exception as e:
+            logger.error(f"Error in feature importance: {e}")
+            st.error(f"Error in feature importance: {e}")
+    else:
+        st.warning("No ML model loaded. Train a model to view feature importance.")
 
 with tab4:
     st.markdown("""
     ### 📊 Model Performance Metrics
     **Instructions:**
-    - Evaluate model performance using accuracy, precision, recall, and F1-score.
-    - Review ROC curve and prediction distribution for insights.
-    - Ensure sufficient trade data for reliable metrics.
+    - Review detailed performance metrics of the ML model.
+    - Analyze ROC curve, confusion matrix, and confidence levels.
+    - Use these metrics to evaluate model effectiveness.
     """)
     
-    try:
-        if ml_filter.model is not None:
-            st.markdown("**Model Validation**")
-            trades = db_manager.get_trades(limit=200, exchange=current_exchange, user_id=user_id, virtual=(account_type == 'virtual'))
+    if ml_filter.model is not None:
+        try:
+            trades = db_manager.get_trades(limit=500, exchange=current_exchange, user_id=user_id, virtual=(account_type == 'virtual'))
             trades_list = [t.to_dict() for t in trades]
             valid_trades = [t for t in trades_list if t['indicators'] and t['pnl'] is not None]
+        except Exception as e:
+            logger.error(f"Error retrieving trades for model performance analysis: {e}")
+            st.error(f"Error retrieving trades: {e}")
+            st.stop()
             
             if len(valid_trades) > 20:
                 X_val = []
@@ -797,9 +696,6 @@ with tab4:
         else:
             st.warning("No ML model loaded. Train a model first.")
     
-    except Exception as e:
-        logger.error(f"Error in model performance analysis: {e}")
-        st.error(f"Error in model performance analysis: {e}")
 
 with tab5:
     st.markdown("""
