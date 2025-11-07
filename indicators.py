@@ -1,100 +1,133 @@
+# indicators.py - NO API KEYS REQUIRED - WORKS 2025
 import pandas as pd
 import numpy as np
 import time
+import requests
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from logging_config import get_trading_logger
-from exceptions import APIConnectionException, APIDataException
-from binance_client import BinanceClient
-from bybit_client import BybitClient
+import logging
 
-logger = get_trading_logger(__name__)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# === CLIENT CACHE ===
-_client_cache = {}
-def get_client(exchange: str):
-    if exchange not in _client_cache:
-        if exchange == "binance":
-            _client_cache[exchange] = BinanceClient()
-        elif exchange == "bybit":
-            _client_cache[exchange] = BybitClient()
-        else:
-            raise ValueError(f"Unsupported exchange: {exchange}")
-    return _client_cache[exchange]
+# === PUBLIC ENDPOINTS (NO AUTH NEEDED) ===
+BINANCE_BASE = "https://api.binance.com"
+BYBIT_BASE = "https://api.bybit.com"
 
-# === FALLBACK SYMBOLS (SAFE & VALID) ===
 SAFE_SYMBOLS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
     "BNBUSDT", "ADAUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT"
 ]
 
-# === TOP SYMBOLS (WITH RETRY + FALLBACK) ===
-def get_top_symbols(exchange: str, limit: int = 50) -> List[str]:
-    client = get_client(exchange)
-    try:
-        symbols = []
-        if exchange == "binance":
-            tickers = client.exchange.fetch_tickers()
-            symbols = [
-                s.replace('/', '') for s, t in tickers.items()
-                if s.endswith('/USDT') and t.get('quoteVolume', 0) > 0
-            ]
-        elif exchange == "bybit":
-            result = client._make_request("GET", "/v5/market/tickers", {"category": "linear"})
-            if result.get("retCode") != 0:
-                raise Exception(f"Bybit tickers error: {result.get('retMsg')}")
-            symbols = [item["symbol"] for item in result["result"]["list"] if item["symbol"].endswith("USDT")]
-        
-        # Sort by volume (fallback to safe list if fails)
-        if len(symbols) < limit:
-            raise Exception("Not enough symbols")
-        symbols.sort(
-            key=lambda s: client.get_current_price(s) * client._make_request(
-                "GET", "/v5/market/tickers", {"category": "linear", "symbol": s}
-            )["result"]["list"][0].get("turnover24h", 0) if exchange == "bybit" else 1,
-            reverse=True
-        )
-        return symbols[:limit]
+def rate_limited_request(url: str, params: dict = None, max_retries: int = 3) -> Optional[dict]:
+    for i in range(max_retries):
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:
+                wait = 2 ** i
+                logger.warning(f"Rate limited, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                logger.debug(f"HTTP {response.status_code}: {response.text}")
+        except Exception as e:
+            logger.debug(f"Request failed: {e}")
+            time.sleep(1)
+    return None
 
+# === GET TOP SYMBOLS (PUBLIC) ===
+def get_top_symbols(exchange: str, limit: int = 50) -> List[str]:
+    try:
+        if exchange == "binance":
+            data = rate_limited_request(f"{BINANCE_BASE}/api/v3/ticker/24hr")
+            if not data:
+                raise Exception("No data")
+            symbols = [
+                d['symbol'] for d in data
+                if d['symbol'].endswith('USDT') and float(d['quoteVolume']) > 1e7
+            ]
+            symbols.sort(key=lambda s: next((d['quoteVolume'] for d in data if d['symbol'] == s), 0), reverse=True)
+            return symbols[:limit]
+
+        elif exchange == "bybit":
+            data = rate_limited_request(f"{BYBIT_BASE}/v5/market/tickers", {"category": "linear"})
+            if not data or data.get("retCode") != 0:
+                raise Exception(f"Bybit error: {data}")
+            symbols = [
+                item["symbol"] for item in data["result"]["list"]
+                if item["symbol"].endswith("USDT") and float(item.get("turnover24h", 0)) > 1e7
+            ]
+            symbols.sort(
+                key=lambda s: float(next(
+                    (item["turnover24h"] for item in data["result"]["list"] if item["symbol"] == s),
+                    0
+                )),
+                reverse=True
+            )
+            return symbols[:limit]
     except Exception as e:
-        logger.warning(f"Top symbols failed ({exchange}): {e} → using fallback")
+        logger.warning(f"Top symbols failed ({exchange}): {e} → using SAFE_SYMBOLS")
         return SAFE_SYMBOLS[:limit]
 
-# === KLINE FETCH (WITH RETRY + VALIDATION) ===
+# === FETCH KLINES (PUBLIC ENDPOINTS ONLY) ===
 def fetch_klines(exchange: str, symbol: str, timeframe: str = '1h', limit: int = 200) -> Optional[pd.DataFrame]:
-    client = get_client(exchange)
     for attempt in range(3):
         try:
             if exchange == "binance":
-                raw = client.exchange.fetch_ohlcv(symbol.replace('USDT', '/USDT'), timeframe, limit=limit)
-            else:  # bybit
-                result = client._make_request("GET", "/v5/market/kline", {
-                    "category": "linear", "symbol": symbol, "interval": timeframe, "limit": limit
-                })
-                if result.get("retCode") != 0 or not result.get("result", {}).get("list"):
-                    raise Exception("Invalid kline response")
-                raw = [[int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5])] for k in result["result"]["list"]]
+                params = {
+                    "symbol": symbol,
+                    "interval": timeframe,
+                    "limit": limit
+                }
+                raw = rate_limited_request(f"{BINANCE_BASE}/api/v3/klines", params)
+                if not raw or len(raw) < 50:
+                    raise Exception("Insufficient data")
 
-            if not raw or len(raw) < 50:
-                raise Exception("Insufficient data")
+                df = pd.DataFrame(raw, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                    'close_time', 'quote_volume', 'trades', 'tb_base', 'tb_quote', 'ignore'
+                ])
+                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].astype(float)
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
 
-            df = pd.DataFrame(raw, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+            elif exchange == "bybit":
+                params = {
+                    "category": "linear",
+                    "symbol": symbol,
+                    "interval": timeframe.replace('h', '60').replace('m', ''),
+                    "limit": limit
+                }
+                raw = rate_limited_request(f"{BYBIT_BASE}/v5/market/kline", params)
+                if not raw or raw.get("retCode") != 0 or not raw.get("result", {}).get("list"):
+                    raise Exception("Invalid response")
+                
+                klines = raw["result"]["list"]
+                df = pd.DataFrame(klines, columns=[
+                    'timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'
+                ])
+                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].astype(float)
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+
             df.set_index('timestamp', inplace=True)
             df = df[~df.index.duplicated(keep='last')].sort_index()
-            return df.dropna() if len(df) >= 50 else None
+            df = df.dropna()
+
+            if len(df) >= 50:
+                return df
 
         except Exception as e:
-            logger.debug(f"Kline retry {attempt+1}/3 for {symbol}: {e}")
-            time.sleep(1)
-    logger.error(f"Kline failed for {symbol}")
+            logger.debug(f"Kline retry {attempt+1}/3 for {symbol} ({exchange}): {e}")
+            time.sleep(2 ** attempt)
+
+    logger.error(f"Kline failed permanently: {symbol} on {exchange}")
     return None
 
-# === INDICATOR CALCULATIONS (CLEAN & SAFE) ===
+# === INDICATORS ===
 def calculate_rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
-    gain = delta.clip(lower=0).rolling(window=period).mean()
-    loss = (-delta.clip(upper=0)).rolling(window=period).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
     rs = gain / (loss + 1e-10)
     return 100 - (100 / (1 + rs))
 
@@ -103,7 +136,7 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high_close = (df['high'] - df['close'].shift()).abs()
     low_close = (df['low'] - df['close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -113,7 +146,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['atr'] = calculate_atr(df)
     return df.dropna()
 
-# === SIGNAL ANALYSIS (ROBUST & FAST) ===
+# === SIGNAL LOGIC ===
 def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Optional[Dict[str, Any]]:
     df = fetch_klines(exchange, symbol, timeframe)
     if df is None or len(df) < 100:
@@ -123,88 +156,87 @@ def analyze_symbol(exchange: str, symbol: str, timeframe: str = '1h') -> Optiona
     if df.empty:
         return None
 
-    p = df['close'].iloc[-1]
-    sma20 = df['sma20'].iloc[-1]
-    sma50 = df['sma50'].iloc[-1]
-    rsi = df['rsi'].iloc[-1]
-    atr = df['atr'].iloc[-1]
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    # === SIMPLE STRATEGY: RSI + SMA CROSS + VOLATILITY FILTER ===
     score = 0
-    side = "HOLD"
     conditions = []
+    side = "HOLD"
 
-    # RSI Oversold/Overbought
-    if rsi < 30:
+    # RSI
+    if latest['rsi'] < 30:
         score += 40
-        conditions.append("RSI_oversold")
-    elif rsi > 70:
+        conditions.append("RSI_OVERSOLD")
+    elif latest['rsi'] > 70:
         score += 40
-        conditions.append("RSI_overbought")
+        conditions.append("RSI_OVERBOUGHT")
 
     # SMA Trend
-    if sma20 > sma50:
+    if latest['sma20'] > latest['sma50']:
         score += 30
-        conditions.append("SMA_bullish")
+        conditions.append("BULLISH_TREND")
     else:
         score += 30
-        conditions.append("SMA_bearish")
+        conditions.append("BEARISH_TREND")
 
-    # Volatility filter (avoid low ATR)
-    if atr > p * 0.005:  # >0.5%
+    # Volatility
+    if latest['atr'] > latest['close'] * 0.006:
         score += 20
-        conditions.append("High_volatility")
+        conditions.append("HIGH_VOL")
 
-    # Final decision
-    if score >= 70 and "RSI_oversold" in conditions and "SMA_bullish" in conditions:
+    # Entry logic
+    if score >= 80 and "RSI_OVERSOLD" in conditions and "BULLISH_TREND" in conditions:
         side = "BUY"
-    elif score >= 70 and "RSI_overbought" in conditions and "SMA_bearish" in conditions:
+    elif score >= 80 and "RSI_OVERBOUGHT" in conditions and "BEARISH_TREND" in conditions:
         side = "SELL"
 
+    if side == "HOLD":
+        return None
+
+    price = latest['close']
     return {
         "symbol": symbol,
         "side": side,
-        "score": score,
-        "price": float(p),
-        "rsi": float(rsi),
-        "sma20": float(sma20),
-        "sma50": float(sma50),
-        "atr": float(atr),
+        "score": int(score),
+        "price": float(price),
+        "rsi": round(latest['rsi'], 2),
+        "sma20": round(latest['sma20'], 4),
+        "sma50": round(latest['sma50'], 4),
+        "atr": round(latest['atr'], 4),
         "conditions": conditions,
         "timestamp": df.index[-1].isoformat(),
-        "entry": float(p),
-        "tp": float(p * 1.015 if side == "BUY" else p * 0.985),
-        "sl": float(p * 0.985 if side == "BUY" else p * 1.015),
+        "tp": round(price * 1.02 if side == "BUY" else price * 0.98, 4),
+        "sl": round(price * 0.98 if side == "BUY" else price * 1.02, 4),
         "leverage": 5
     }
 
-# === PARALLEL SCANNER ===
-def scan_symbols(exchange: str, symbols: List[str], timeframe: str = '1h') -> List[Dict]:
+# === SCANNER ===
+def scan_symbols(exchange: str, limit: int = 20, timeframe: str = '1h') -> List[Dict]:
+    symbols = get_top_symbols(exchange, limit * 2)[:limit * 2]
     results = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(analyze_symbol, exchange, s, timeframe): s for s in symbols}
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {
+            executor.submit(analyze_symbol, exchange, symbol, timeframe): symbol
+            for symbol in symbols
+        }
         for future in as_completed(futures):
             try:
-                if result := future.result(timeout=20):
+                if result := future.result(timeout=15):
                     results.append(result)
             except:
                 pass
-    logger.info(f"Scanned {len(results)}/{len(symbols)} symbols")
-    return sorted(results, key=lambda x: x["score"], reverse=True)
+            time.sleep(0.2)  # Be gentle on APIs
 
-# === MARKET OVERVIEW ===
-def get_market_overview(exchange: str) -> Dict:
-    client = get_client(exchange)
-    try:
-        price = client.get_current_price("BTCUSDT")
-        return {"btc_price": price, "timestamp": time.time()}
-    except:
-        return {"btc_price": 0, "timestamp": time.time()}
+    results.sort(key=lambda x: x["score"], reverse=True)
+    logger.info(f"Scan complete: {len(results)} signals from {len(symbols)} symbols")
+    return results
 
-# === MAIN TEST ===
+# === TEST ===
 if __name__ == "__main__":
-    exchange = "bybit"
-    symbols = get_top_symbols(exchange, 10)
-    results = scan_symbols(exchange, symbols)
-    for r in results[:5]:
-        print(f"{r['symbol']}: {r['side']} | Score: {r['score']} | RSI: {r['rsi']:.1f}")
+    exchange = "bybit"  # or "binance"
+    signals = scan_symbols(exchange, limit=15)
+    
+    print(f"\nTOP SIGNALS on {exchange.upper()} ({time.strftime('%Y-%m-%d %H:%M')})\n")
+    for s in signals[:10]:
+        print(f"{s['symbol']:>10} | {s['side']:^4} | Score: {s['score']} | RSI: {s['rsi']:>5} | Price: {s['price']:>10} | {', '.join(s['conditions'])}")

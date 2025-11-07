@@ -179,10 +179,15 @@ class Settings(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, nullable=False, index=True)
-    key = Column(String(100), nullable=False, unique=True, index=True)
+    key = Column(String(100), nullable=False)
     value = Column(JSON, nullable=False)
     description = Column(Text, nullable=True)
     updated_at = Column(DateTime(timezone=True), default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
+
+    # FIX: Unique per user, NOT globally!
+    __table_args__ = (
+        Index('ix_settings_user_key', 'user_id', 'key', unique=True),
+    )
 
 class FeedbackModel(Base):
     __tablename__ = "ml_feedback"

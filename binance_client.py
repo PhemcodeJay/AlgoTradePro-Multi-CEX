@@ -92,10 +92,17 @@ class BinanceClient:
 
         # Time sync on init
         try:
-            self.exchange.load_time_difference()
-            logger.info(f"Time sync successful. Offset: {self.exchange.timeDifference}ms")
+            server_time = self.exchange.fetch_time()
+            self.time_offset = server_time - int(time.time() * 1000)
+            logger.info(f"Time sync successful. Offset: {self.time_offset}ms")
         except Exception as e:
             logger.warning(f"Time sync failed at startup: {e}")
+            self.time_offset = 0
+            ts = int(time.time() * 1000) + getattr(self, 'time_offset', 0)
+            server_time = self.exchange.fetch_time()
+            self.time_offset = server_time - int(time.time() * 1000)
+
+        
 
         self._initialize_session()
         self._test_connection()
@@ -153,7 +160,7 @@ class BinanceClient:
         self.total_requests += 1
         self._check_rate_limit()
         self._check_production_rate_limit()
-
+        ts = int(time.time() * 1000) + self.time_offset
         url = f"{self.base_url}{endpoint}"
         headers = {'X-MBX-APIKEY': self.api_key}
 

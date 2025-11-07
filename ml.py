@@ -1,3 +1,4 @@
+# ml.py
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Any, Optional
@@ -37,7 +38,6 @@ class MLFilter:
     def prepare_features(self, indicators: Dict[str, Any]) -> Optional[NDArray[np.float64]]:
         """Prepare features from indicators for ML prediction"""
         try:
-            # Extract indicators matching those from indicators.py
             features = []
             for key in self.feature_columns:
                 value = indicators.get(key, 0.0)
@@ -122,7 +122,7 @@ class MLFilter:
                     continue
                 
                 features_scaled = self.scaler.transform(features)
-                prob = self.model.predict_proba(features_scaled)[0][1]  # Probability of positive outcome
+                prob = self.model.predict_proba(features_scaled)[0][1]
                 
                 signal['ml_score'] = float(prob)
                 if prob >= threshold:
@@ -136,7 +136,6 @@ class MLFilter:
             return signals
 
     def save_model(self) -> bool:
-        """Save trained model and scaler"""
         try:
             os.makedirs('models', exist_ok=True)
             joblib.dump(self.model, self.model_path)
@@ -148,7 +147,6 @@ class MLFilter:
             return False
 
     def load_model(self) -> bool:
-        """Load saved model and scaler"""
         try:
             if os.path.exists(self.model_path) and os.path.exists(self.scaler_path):
                 self.model = joblib.load(self.model_path)
@@ -162,7 +160,6 @@ class MLFilter:
             return False
 
     def update_model_with_feedback(self, signal: Dict, outcome: bool):
-        """Update model with feedback from trade outcome"""
         try:
             logger.info(f"Feedback received for {signal.get('symbol')} on {self.exchange} (user {self.user_id}): {outcome}")
             
@@ -178,7 +175,6 @@ class MLFilter:
                 )
                 db_manager.add_feedback(feedback_model)
                 
-                # Retrain if enough new feedback
                 feedback = db_manager.get_feedback(limit=100, exchange=self.exchange, user_id=self.user_id)
                 if len(feedback) >= 50:
                     training_data = [
@@ -191,7 +187,6 @@ class MLFilter:
             logger.error(f"Error updating model with feedback for {self.exchange} (user {self.user_id}): {e}")
 
     def get_feature_importance(self) -> Dict[str, float]:
-        """Get feature importance from trained model"""
         try:
             if self.model is None:
                 logger.warning(f"No trained model available for {self.exchange} (user {self.user_id})")
@@ -199,7 +194,6 @@ class MLFilter:
             
             importance = self.model.feature_importances_
             feature_importance = dict(zip(self.feature_columns, importance))
-            
             return dict(sorted(feature_importance.items(), key=lambda x: x[1], reverse=True))
             
         except Exception as e:
