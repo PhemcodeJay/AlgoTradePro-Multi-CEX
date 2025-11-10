@@ -197,6 +197,13 @@ st.markdown("""
 - Use filters to view recent signals by score or side.
 """)
 
+# Define interval mapping for API-compatible timeframe strings
+interval_map = {
+    "60": "1h",
+    "240": "4h",
+    "1440": "1d"
+}
+
 col1, col2, col3 = st.columns([2, 2, 2])
 
 with col1:
@@ -218,11 +225,13 @@ with col1:
         if symbol_input:
             with st.spinner(f"Analyzing {symbol_input}..."):
                 try:
-                    result = analyze_single_symbol(current_exchange, symbol_input.upper(), interval)
+                    # Use mapped interval for API call
+                    mapped_interval = interval_map[interval]
+                    result = analyze_single_symbol(current_exchange, symbol_input.upper(), mapped_interval)
                     if isinstance(result, dict) and result.get('symbol'):
                         signal = {
                             'symbol': str(result.get('symbol', '')),
-                            'interval': str(interval),
+                            'interval': str(interval),  # Store original interval (minutes)
                             'signal_type': str(result.get('signal_type', 'neutral')),
                             'side': str(result.get('side', 'HOLD')),
                             'score': float(result.get('score', 0.0)),
@@ -244,48 +253,42 @@ with col1:
                             st.warning(f"⚠️ Invalid indicator data for {symbol_input}")
                         elif db_manager.add_signal(signal):
                             st.success(f"✅ Signal generated and saved for {symbol_input}")
-                            st.rerun()
                         else:
-                            st.warning(f"⚠️ Failed to save signal for {symbol_input}")
+                            st.error("❌ Failed to save signal")
                     else:
-                        st.warning(f"⚠️ No signal generated for {symbol_input}. This may be due to API restrictions or insufficient data.")
+                        st.info(f"📭 No signal generated for {symbol_input}")
                 except Exception as e:
-                    error_msg = str(e)
-                    if "451" in error_msg or "403" in error_msg or "restricted location" in error_msg:
-                        st.error(f"⚠️ API access restricted for {symbol_input}. Try using a VPN or deploying in an unrestricted region.")
+                    if "APIError(code=-1003)" in str(e) or "too many requests" in str(e).lower():
+                        st.error(f"⚠️ API Access Restricted for {current_exchange.title()}")
+                        st.info(
+                            f"The {current_exchange.title()} API rejected the request. "
+                            "Try using a VPN or deploying in an unrestricted region (e.g., Europe via AWS). "
+                            "Alternatively, switch to another exchange in the settings."
+                        )
                     else:
-                        st.error(f"Error analyzing {symbol_input}: {e}")
-                    logger.error(f"Analyze symbol error: {e}")
-        else:
-            st.error("Please enter a valid symbol")
+                        st.error(f"Error analyzing symbol: {e}")
+                    logger.error(f"Symbol analysis error: {e}")
 
 with col2:
-    if st.button("🚀 Generate Top Signals", type="primary", use_container_width=True):
-        with st.spinner(f"Generating top {top_n} signals..."):
+    if st.button("📡 Generate Signals", type="primary", use_container_width=True):
+        with st.spinner("Generating signals..."):
             try:
-                signals = generate_signals(
-                    exchange=current_exchange,
-                    timeframe=interval,
-                    max_symbols=top_n,
-                    user_id=user_id
-                )
+                # Use mapped interval for API call
+                mapped_interval = interval_map[interval]
+                signals = generate_signals(current_exchange, mapped_interval, top_n, user_id)
                 saved = 0
                 for signal in signals:
+                    # Adjust interval back to minutes for storage consistency
                     signal['interval'] = str(interval)
-                    signal['exchange'] = str(current_exchange)
-                    signal['created_at'] = str(datetime.now(timezone.utc).isoformat())
-                    signal['user_id'] = user_id
-                    signal['indicators'] = convert_np_types(signal.get('indicators', {}))
                     if db_manager.add_signal(signal):
                         saved += 1
                 if saved > 0:
                     st.success(f"✅ Generated and saved {saved} signals")
-                    st.rerun()
+                    send_all_notifications(signals)
                 else:
-                    st.warning("⚠️ No new signals generated or saved")
+                    st.info("📭 No signals generated")
             except Exception as e:
-                error_str = str(e)
-                if "403" in error_str or "451" in error_str or "restricted location" in error_str:
+                if "APIError(code=-1003)" in str(e) or "too many requests" in str(e).lower():
                     st.error(f"⚠️ API Access Restricted for {current_exchange.title()}")
                     st.info(
                         f"The {current_exchange.title()} API rejected the request. "
