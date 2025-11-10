@@ -226,6 +226,32 @@ class TradingEngine:
                 logger.info(f"Initialized {mode} wallet: ${init:.2f}")
 
     def get_balance(self) -> Dict[str, float]:
+        # For real accounts, sync with exchange API first
+        if self.account_type == "real" and self.client:
+            try:
+                api_balance = self.client.get_balance()
+                if api_balance and isinstance(api_balance, dict):
+                    available = float(api_balance.get('available', 0.0))
+                    total = float(api_balance.get('total', 0.0))
+                    used = total - available
+                    
+                    # Update database with fresh API data
+                    self.db.update_wallet_balance(
+                        self.account_type,
+                        self.user_id,
+                        available=available,
+                        used=used,
+                        exchange=self.exchange
+                    )
+                    return {
+                        "total": total,
+                        "available": available,
+                        "used": used,
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to sync real balance from {self.exchange}: {e}")
+        
+        # Fallback to database or virtual balance
         w = self.db.get_wallet_balance(self.account_type, self.user_id, self.exchange)
         if not w:
             return {"total": 0.0, "available": 0.0, "used": 0.0}
@@ -386,24 +412,29 @@ class TradingEngine:
         side = signal.get("side", "Buy").upper()
         entry_price = float(signal.get("entry") or (self.client.get_current_price(symbol) if self.client else 0))
         if entry_price <= 0:
+            logger.error(f"Invalid entry price for {symbol}: {entry_price}")
             return False
 
         qty = self.calculate_position_size(symbol, entry_price)
         if qty <= 0:
+            logger.warning(f"Invalid position size for {symbol}: {qty}")
             return False
 
-        if len(self.get_open_trades(virtual=False)) >= self.max_open_positions:
-            logger.warning("Max open positions reached")
+        # Check open positions for current account type
+        open_count = len(self.get_open_trades(virtual=(self.account_type == "virtual")))
+        if open_count >= self.max_open_positions:
+            logger.warning(f"Max open positions reached: {open_count}/{self.max_open_positions}")
             return False
 
         trade = self._create_trade(signal, qty, entry_price)
         if not self.db.add_trade(trade):
+            logger.error(f"Failed to add trade to database: {symbol}")
             return False
 
         if self.account_type == "virtual":
             self.db.update_trade(trade.id, {"status": "open"})
             self._update_wallet(used_delta=qty * entry_price)
-            logger.info(f"Virtual {side} {symbol} @ {entry_price:.2f}")
+            logger.info(f"Virtual {side} {symbol} @ {entry_price:.2f} | Qty: {qty} | SL: {signal.get('sl')} | TP: {signal.get('tp')}")
             self.successful_trades += 1
             return True
 
@@ -418,9 +449,9 @@ class TradingEngine:
                     side=trade.side,
                     qty=trade.qty,
                     leverage=signal.get("leverage", 15),
-                    mode="CROSS",
-                    stop_loss=signal.get("sl"),
-                    take_profit=signal.get("tp"),
+                    stopLoss=signal.get("sl"),
+                    takeProfit=signal.get("tp"),
+                    user_id=self.user_id
                 )
                 if self._is_order_success(order):
                     order_id = self._extract_order_id(order)
@@ -545,6 +576,26 @@ class TradingEngine:
     # Cleanup
     # ----------------------------------------------------------------------
     def close(self):
-        if hasattr(self.client, "close"):
-            self.client.close()
-        logger.info("TradingEngine closed")
+        """Gracefully shutdown trading engine and cleanup resources"""
+        try:
+            # Disable trading first
+            self._trading_enabled = False
+            
+            # Close client connection
+            if hasattr(self, 'client') and self.client and hasattr(self.client, "close"):
+                try:
+                    self.client.close()
+                    logger.info(f"Closed {self.exchange} client connection")
+                except Exception as e:
+                    logger.warning(f"Error closing client: {e}")
+            
+            # Clear cache
+            if hasattr(self, '_candle_cache'):
+                self._candle_cache.clear()
+            
+            # Reset state
+            self._connected = False
+            
+            logger.info(f"TradingEngine closed successfully for user {self.user_id}")
+        except Exception as e:
+            logger.error(f"Error during TradingEngine shutdown: {e}", exc_info=True)

@@ -58,7 +58,7 @@ def generate_signals(
         return []
 
     try:
-        logger.info(f"Generating signals | {exchange.upper()} | {timeframe} | max={max_symbols}")
+        logger.info(f"Generating signals | {exchange.upper()} | {timeframe} | max={max_symbols} | user={user_id}")
 
         # 1. Get top symbols
         symbols = get_top_symbols(exchange, max_symbols * 2)
@@ -66,7 +66,7 @@ def generate_signals(
             logger.warning(f"No symbols for {exchange}")
             return []
 
-        # 2. Parallel analysis
+        # 2. Parallel analysis with error handling
         with ThreadPoolExecutor(max_workers=10) as executor:
             future_to_symbol = {
                 executor.submit(analyze_symbol, exchange, sym, timeframe): sym
@@ -90,7 +90,7 @@ def generate_signals(
 
         # 3. ML Filter
         try:
-            ml_filter = MLFilter(user_id=user_id, exchange=exchange)
+            ml_filter = MLFilter(user_id=str(user_id) if user_id else "1", exchange=exchange)
             filtered_signals = ml_filter.filter_signals(raw_results)
         except Exception as e:
             logger.warning(f"ML filter failed: {e} → using raw")
@@ -110,6 +110,10 @@ def generate_signals(
             sig.setdefault('liquidation', 0.0)
             sig.setdefault('margin_usdt', 10.0)
             sig.setdefault('indicators', {})
+            # Ensure exchange and user_id are present
+            sig['exchange'] = exchange
+            sig['user_id'] = user_id
+            sig['timeframe'] = timeframe
 
         # 6. Save to DB
         saved = 0
@@ -135,7 +139,8 @@ def generate_signals(
             if user_id is not None:
                 db_signal['user_id'] = user_id
 
-            if db_manager.add_signal(db_signal):
+            db = db_manager.DatabaseManager()
+            if db.add_signal(db_signal):
                 saved += 1
 
         logger.info(f"Generated {len(sorted_signals)} | Saved {saved} | {exchange.upper()}")
@@ -154,12 +159,16 @@ def convert_np_types(data: Any) -> Any:
         return {k: convert_np_types(v) for k, v in data.items()}
     elif isinstance(data, list):
         return [convert_np_types(item) for item in data]
-    elif isinstance(data, (np.float64, np.float32, np.float_)):
+    elif isinstance(data, (np.float64, np.float32)):
         return float(data)
-    elif isinstance(data, (np.int64, np.int32, np.int_)):
+    elif isinstance(data, (np.int64, np.int32)):
         return int(data)
     elif isinstance(data, np.ndarray):
         return data.tolist()
+    elif hasattr(np, 'float_') and isinstance(data, np.float_):
+        return float(data)
+    elif hasattr(np, 'int_') and isinstance(data, np.int_):
+        return int(data)
     return data
 
 
@@ -168,14 +177,15 @@ def convert_np_types(data: Any) -> Any:
 # --------------------------------------------------------------------------- #
 def get_signal_summary(exchange: str, user_id: Optional[int] = None) -> Dict[str, Any]:
     try:
-        signals = db_manager.get_signals(limit=100, exchange=exchange.lower(), user_id=user_id)
-        buy = len([s for s in signals if getattr(s, 'side', '').lower() == 'buy'])
-        sell = len([s for s in signals if getattr(s, 'side', '').lower() == 'sell'])
+        db = db_manager.DatabaseManager()
+        signals = db.get_signals(limit=100, exchange=exchange.lower(), user_id=user_id)
+        buy = len([s for s in signals if isinstance(s, dict) and s.get('side', '').lower() == 'buy'])
+        sell = len([s for s in signals if isinstance(s, dict) and s.get('side', '').lower() == 'sell'])
         last = None
         if signals:
-            times = [s.created_at for s in signals if hasattr(s, 'created_at') and s.created_at]
+            times = [s.get('created_at') for s in signals if isinstance(s, dict) and s.get('created_at')]
             if times:
-                last = max(datetime.fromisoformat(t.replace('Z', '+00:00')) for t in times)
+                last = max(datetime.fromisoformat(t.replace('Z', '+00:00')) if isinstance(t, str) else t for t in times if t)
         return {
             'exchange': exchange.lower(),
             'total_signals': len(signals),
@@ -243,7 +253,7 @@ def analyze_single_symbol(
     except Exception as e:
         logger.error(f"analyze_single_symbol failed for {symbol}: {e}", exc_info=True)
         return None
-    
+
 # --------------------------------------------------------------------------- #
 # Main: Test
 # --------------------------------------------------------------------------- #

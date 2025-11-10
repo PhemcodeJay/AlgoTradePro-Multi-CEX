@@ -72,18 +72,33 @@ def register_user(username: str, password: str) -> bool:
             session.add(new_user)
             session.flush()
 
+            # Enhanced virtual balance for demo accounts
+            virtual_balance = 10000.0 if username == "demo" else 100.0
+            
             for acc in ("virtual", "real"):
                 session.add(WalletBalance(
                     user_id=new_user.id,
                     account_type=acc,
-                    available=100.0 if acc == "virtual" else 0.0,
+                    available=virtual_balance if acc == "virtual" else 0.0,
                     used=0.0,
-                    total=100.0 if acc == "virtual" else 0.0,
+                    total=virtual_balance if acc == "virtual" else 0.0,
                     currency="USDT",
                     exchange="bybit",
                 ))
 
-            save_settings({"EXCHANGE": "bybit", "TRADING_MODE": "virtual"}, new_user.id)
+            # Demo account gets enhanced settings
+            demo_settings = {
+                "EXCHANGE": "bybit",
+                "TRADING_MODE": "virtual",
+                "AUTO_TRADING_ENABLED": True if username == "demo" else False,
+                "NOTIFICATION_ENABLED": True,
+                "ML_ENABLED": True,
+                "SCAN_INTERVAL": 3600,
+                "MAX_OPEN_POSITIONS": 10,
+                "LEVERAGE": 10,
+                "TOP_N_SIGNALS": 10
+            }
+            save_settings(demo_settings, new_user.id)
             session.commit()
             logger.info(f"Registered: {username}")
             return True
@@ -100,6 +115,26 @@ def register_user(username: str, password: str) -> bool:
 if not st.session_state.authenticated:
     st.title("AlgoTraderPro - Kenya's #1 Trading Bot")
     st.markdown("### Login or Create Account (Free Forever)")
+    
+    # Demo Account Quick Access
+    st.info("🎯 **Quick Start**: Click below to try the platform with a demo account!")
+    if st.button("🚀 Try Demo Account", type="primary", use_container_width=True):
+        # Create demo user if doesn't exist
+        demo_username = "demo"
+        demo_password = "demo123"
+        
+        with db_manager.get_session() as session:
+            demo_user = session.query(User).filter_by(username=demo_username).first()
+            if not demo_user:
+                # Register demo user
+                register_user(demo_username, demo_password)
+        
+        # Auto login
+        if authenticate_user(demo_username, demo_password):
+            st.rerun()
+    
+    st.divider()
+    st.markdown("### Or Login/Register")
 
     c1, c2 = st.columns(2)
 
@@ -156,13 +191,20 @@ def initialize_app():
         ex = settings.get("EXCHANGE", "bybit").lower()
         mode = settings.get("TRADING_MODE", "virtual").lower()
 
-        has_keys, _ = validate_env(exchange=ex, user_id=uid)
-        st.session_state.has_api_keys = has_keys
-        st.session_state.account_type = "virtual" if not has_keys else mode
+        # Always force virtual for demo accounts
+        if st.session_state.user.get("username") == "demo":
+            mode = "virtual"
+            st.session_state.account_type = "virtual"
+        else:
+            has_keys, _ = validate_env(exchange=ex, user_id=uid)
+            st.session_state.has_api_keys = has_keys
+            st.session_state.account_type = "virtual" if not has_keys else mode
 
         engine = TradingEngine(uid, ex, st.session_state.account_type)
         engine.switch_exchange(ex)
-        if st.session_state.account_type == "real" and has_keys:
+        
+        # Only enable real trading if we have keys AND mode is real
+        if st.session_state.account_type == "real" and st.session_state.get('has_api_keys', False):
             engine.enable_trading()
 
         trader = AutomatedTrader(engine)
@@ -172,10 +214,12 @@ def initialize_app():
         st.session_state.current_exchange = ex
         st.session_state.initialized = True
 
+        logger.info(f"App initialized successfully for user {uid} in {st.session_state.account_type} mode")
         return True
     except Exception as e:
-        logger.error(f"Init failed: {e}", exc_info=True)
-        st.error("Bot failed to start")
+        logger.critical(f"App initialization failed: {e}", exc_info=True)
+        st.error(f"⚠️ Initialization Error: {str(e)}")
+        st.info("💡 Try refreshing the page. If the issue persists, please contact support.")
         return False
 
 
@@ -187,17 +231,27 @@ if not st.session_state.initialized:
 
 
 # ========================= HEADER =========================
+username = st.session_state.user.get('username', 'N/A') if st.session_state.user else 'N/A'
+current_exchange = st.session_state.get('current_exchange', 'bybit')
+account_type = st.session_state.get('account_type', 'virtual')
+is_demo = username == "demo"
+
+demo_badge = "🎯 DEMO ACCOUNT" if is_demo else ""
+
 st.markdown(f"""
 <div style='padding: 1.5rem; background: linear-gradient(90deg, #00C9FF, #92FE9D); 
      border-radius: 15px; text-align: center; color: black; margin-bottom: 2rem;'>
     <h1 style='margin:0;'>AlgoTraderPro Dashboard</h1>
     <p style='margin:5px 0 0; font-size:1.2rem;'>
-        <strong>{st.session_state.user['username']}</strong> • 
-        {st.session_state.current_exchange.title()} • 
-        {st.session_state.account_type.title()} Mode
+        <strong>{username}</strong> {demo_badge} • 
+        {current_exchange.title()} • 
+        {account_type.title()} Mode
     </p>
 </div>
 """, unsafe_allow_html=True)
+
+if is_demo:
+    st.success("✅ You're using a demo account with $10,000 virtual balance. All features unlocked!")
 
 
 # ========================= SIDEBAR =========================
@@ -258,7 +312,7 @@ def get_data(exchange, acc_type, is_virtual):
     with db_manager.get_session() as s:
         signals = db_manager.get_signals(10, exchange, uid) or []
         wallet = db_manager.get_wallet_balance(acc_type, uid, exchange) or {}
-        trades = db_manager.get_trades(1000, is_virtual, exchange, uid) or []
+        trades = db_manager.get_trades(limit=1000, exchange=exchange, virtual=is_virtual, user_id=uid) or []
 
         open_t = [t for t in trades if getattr(t, 'status', '') == 'open']
         closed_t = [t for t in trades if getattr(t, 'status', '') == 'closed']

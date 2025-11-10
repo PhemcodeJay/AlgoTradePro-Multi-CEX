@@ -224,36 +224,52 @@ class BybitClient:
     def get_balance(self) -> Dict[str, float]:
         try:
             result = self._make_request("GET", "/v5/account/wallet-balance", {"accountType": self.account_type})
-            usdt = next((c for c in result["list"][0]["coin"] if c["coin"] == "USDT"), None)
-            if usdt:
-                return {
-                    "available": float(usdt["availableToWithdraw"]),
-                    "total": float(usdt["walletBalance"])
-                }
-            return {"available": 0.0, "total": 0.0}
-        except:
-            return {"available": 0.0, "total": 0.0}
+            if result and "list" in result and result["list"]:
+                wallet = result["list"][0]
+                coins = wallet.get("coin", [])
+                usdt = next((c for c in coins if c.get("coin") == "USDT"), None)
+                if usdt:
+                    available = float(usdt.get("availableToWithdraw", 0))
+                    total = float(usdt.get("walletBalance", 0))
+                    return {
+                        "available": available,
+                        "total": total,
+                        "used": max(total - available, 0.0)
+                    }
+            return {"available": 0.0, "total": 0.0, "used": 0.0}
+        except Exception as e:
+            logger.error(f"Bybit balance error: {e}")
+            return {"available": 0.0, "total": 0.0, "used": 0.0}
 
     async def place_order(
         self, symbol: str, side: str, qty: float,
         leverage: int = 10, stopLoss: Optional[float] = None,
-        takeProfit: Optional[float] = None, indicators=None
+        takeProfit: Optional[float] = None, indicators=None, user_id: int = 1
     ) -> Dict:
         db = DatabaseManager()
         try:
             side = side.lower()
             if TRADING_MODE == "virtual":
                 price = self.get_current_price(symbol)
-                order_id = f"virtual_{int(time.time()*1000)}"
-                trade = Trade(
-                    order_id=order_id, symbol=symbol, exchange="bybit", virtual=True,
-                    side=side, entry_price=price, qty=qty, leverage=leverage,
-                    sl=stopLoss, tp=takeProfit, indicators=indicators or {}, status="open",
-                    created_at=datetime.now(timezone.utc)
-                )
-                db.add_trade(trade)
-                db.session.commit()
-                return {"order_id": order_id, "status": "filled", "virtual": True}
+                order_id = f"virtual_bybit_{int(time.time()*1000)}"
+                trade_data = {
+                    "user_id": user_id,
+                    "order_id": order_id,
+                    "symbol": symbol,
+                    "exchange": "bybit",
+                    "virtual": True,
+                    "side": side,
+                    "entry_price": price,
+                    "qty": qty,
+                    "leverage": leverage,
+                    "sl": stopLoss,
+                    "tp": takeProfit,
+                    "indicators": indicators or {},
+                    "status": "open"
+                }
+                db.add_trade(trade_data)
+                logger.info(f"Virtual Bybit order: {order_id} | SL: {stopLoss} | TP: {takeProfit}")
+                return {"order_id": order_id, "status": "filled", "virtual": True, "sl": stopLoss, "tp": takeProfit}
 
             # Unified account → force CROSS
             if self.account_type == "UNIFIED":
@@ -271,22 +287,28 @@ class BybitClient:
             if takeProfit: params["takeProfit"] = str(round(takeProfit, 6))
 
             result = await asyncio.to_thread(self._make_request, "POST", "/v5/order/create", params)
-            order_id = result["orderId"]
-            trade = Trade(
-                order_id=order_id, symbol=symbol, exchange="bybit", virtual=False,
-                side=side, entry_price=self.get_current_price(symbol), qty=qty,
-                leverage=leverage, sl=stopLoss, tp=takeProfit,
-                indicators=indicators or {}, status="open",
-                created_at=datetime.now(timezone.utc)
-            )
-            db.add_trade(trade)
-            db.session.commit()
+            order_id = str(result["orderId"])
+            trade_data = {
+                "user_id": user_id,
+                "order_id": order_id,
+                "symbol": symbol,
+                "exchange": "bybit",
+                "virtual": False,
+                "side": side,
+                "entry_price": self.get_current_price(symbol),
+                "qty": qty,
+                "leverage": leverage,
+                "sl": stopLoss,
+                "tp": takeProfit,
+                "indicators": indicators or {},
+                "status": "open"
+            }
+            db.add_trade(trade_data)
+            logger.info(f"Bybit order placed: {order_id}")
             return {"order_id": order_id, "status": "filled"}
         except Exception as e:
             logger.error(f"Order error: {e}")
             return {"error": str(e)}
-        finally:
-            db.session.close()
 
     async def cancel_order(self, symbol: str, order_id: str) -> bool:
         db = DatabaseManager()
@@ -305,8 +327,6 @@ class BybitClient:
             return True
         except:
             return False
-        finally:
-            db.session.close()
 
     async def get_positions(self, symbol: Optional[str] = None) -> List[Dict]:
         try:
@@ -354,12 +374,27 @@ class BybitClient:
 
     def close(self):
         try:
-            if self.ws_connection and self.loop:
-                asyncio.run_coroutine_threadsafe(self.ws_connection.close(), self.loop)
+            if self.ws_connection:
+                try:
+                    if self.loop and self.loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(self.ws_connection.close(), self.loop)
+                        future.result(timeout=5)
+                except Exception as ws_err:
+                    logger.warning(f"WebSocket close warning: {ws_err}")
+            
             if self.session:
-                self.session.close()
-            if self.loop:
-                self.loop.call_soon_threadsafe(self.loop.stop)
-            logger.info("Bybit client closed")
-        except:
-            pass
+                try:
+                    self.session.close()
+                except Exception as sess_err:
+                    logger.warning(f"Session close warning: {sess_err}")
+            
+            if self.loop and self.loop.is_running():
+                try:
+                    self.loop.call_soon_threadsafe(self.loop.stop)
+                except Exception as loop_err:
+                    logger.warning(f"Loop stop warning: {loop_err}")
+            
+            self._connected = False
+            logger.info("Bybit client closed successfully")
+        except Exception as e:
+            logger.error(f"Error during close: {e}", exc_info=True)

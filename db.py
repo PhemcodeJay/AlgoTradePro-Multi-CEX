@@ -22,9 +22,26 @@ TRADING_MODE = os.getenv("TRADING_MODE", "virtual").lower()
 
 # SQLAlchemy setup
 Base = declarative_base()
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, echo=False, pool_size=10, max_overflow=20, pool_recycle=3600)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-ScopedSession = scoped_session(SessionLocal)  # Thread-safe session factory
+
+# Create engine with robust error handling
+try:
+    engine = create_engine(
+        DATABASE_URL, 
+        pool_pre_ping=True, 
+        echo=False, 
+        pool_size=10, 
+        max_overflow=20, 
+        pool_recycle=3600,
+        connect_args={
+            "connect_timeout": 10,
+            "application_name": "AlgoTraderPro"
+        }
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    ScopedSession = scoped_session(SessionLocal)  # Thread-safe session factory
+except Exception as e:
+    logger.critical(f"Failed to create database engine: {e}")
+    raise
 
 # Models
 class User(Base):
@@ -50,7 +67,7 @@ class User(Base):
             "default_exchange": self.default_exchange,
             "created_at": self.created_at.isoformat() if self.created_at else None
         }
-    
+
 class Signal(Base):
     __tablename__ = "signals"
 
@@ -331,7 +348,7 @@ class DatabaseManager:
             except SQLAlchemyError as e:
                 logger.error(f"Error adding signal: {e}")
                 return False
-    
+
     def get_signals(self, limit: int = 100, exchange: Optional[str] = None, user_id: Optional[int] = None, symbol: Optional[str] = None, side: Optional[str] = None) -> List[Dict[str, Any]]:
         with self.get_session() as session:
             try:
@@ -349,7 +366,7 @@ class DatabaseManager:
             except SQLAlchemyError as e:
                 logger.error(f"Error fetching signals: {e}")
                 return []
-            
+
     def add_trade(self, trade: Dict[str, Any]) -> bool:
         with self.get_session() as session:
             try:
@@ -366,10 +383,10 @@ class DatabaseManager:
         with self.get_session() as session:
             try:
                 query = session.query(Trade)
-                if exchange:
-                    query = query.filter(Trade.exchange == exchange)
                 if virtual is not None:
                     query = query.filter(Trade.virtual == virtual)
+                if exchange:
+                    query = query.filter(Trade.exchange == exchange)
                 if user_id:
                     query = query.filter(Trade.user_id == user_id)
                 if hours:
@@ -428,7 +445,17 @@ class DatabaseManager:
                 logger.error(f"Error fetching wallet balance for {account_type}, user {user_id}, exchange {exchange}: {e}")
                 return {"available": 100.0 if account_type == "virtual" else 0.0, "used": 0.0, "total": 100.0 if account_type == "virtual" else 0.0}
 
-    def update_wallet_balance(self, account_type: str, user_id: int, available: float, used: float, exchange: Optional[str] = None) -> bool:
+    def update_wallet_balance(
+        self, 
+        account_type: str, 
+        user_id: int, 
+        available: float = None,
+        used: float = None,
+        exchange: Optional[str] = None,
+        available_delta: float = 0.0,
+        used_delta: float = 0.0,
+        capital_delta: float = 0.0
+    ) -> bool:
         with self.get_session() as session:
             try:
                 query = session.query(WalletBalance).filter(
@@ -438,21 +465,36 @@ class DatabaseManager:
                 if exchange:
                     query = query.filter(WalletBalance.exchange == exchange)
                 balance = query.first()
+
                 if not balance:
+                    # Create new balance entry
+                    init_available = available if available is not None else (100.0 if account_type == "virtual" else 0.0)
+                    init_used = used if used is not None else 0.0
                     balance = WalletBalance(
                         user_id=user_id,
                         account_type=account_type,
-                        available=available,
-                        used=used,
-                        total=available + used,
+                        available=init_available,
+                        used=init_used,
+                        total=init_available + init_used,
                         currency="USDT",
                         exchange=exchange
                     )
                     session.add(balance)
                 else:
-                    balance.available = available
-                    balance.used = used
-                    balance.total = available + used
+                    # Update existing balance
+                    if available is not None:
+                        balance.available = available
+                    else:
+                        balance.available += available_delta
+
+                    if used is not None:
+                        balance.used = used
+                    else:
+                        balance.used += used_delta
+
+                    balance.total = balance.available + balance.used + capital_delta
+
+                balance.updated_at = datetime.now(timezone.utc)
                 session.commit()
                 logger.debug(f"Wallet balance updated: {account_type} for user {user_id}, exchange {exchange}")
                 return True
@@ -514,6 +556,20 @@ class DatabaseManager:
             except SQLAlchemyError as e:
                 logger.error(f"Error fetching trade for order_id {order_id}: {e}")
                 return None
+
+    def get_open_trades(self, virtual: bool, exchange: Optional[str] = None, user_id: Optional[int] = None) -> List[Trade]:
+        """Get all open trades matching the criteria"""
+        with self.get_session() as session:
+            try:
+                query = session.query(Trade).filter(Trade.status == "open", Trade.virtual == virtual)
+                if exchange:
+                    query = query.filter(Trade.exchange == exchange)
+                if user_id:
+                    query = query.filter(Trade.user_id == user_id)
+                return query.order_by(Trade.updated_at.desc()).all()
+            except SQLAlchemyError as e:
+                logger.error(f"Error fetching open trades: {e}")
+                return []
 
     def get_trade_by_position(self, symbol: str, exchange: str, virtual: bool, user_id: int) -> Optional[Trade]:
         with self.get_session() as session:
@@ -590,9 +646,25 @@ class DatabaseManager:
 # Global database manager instance
 db_manager = DatabaseManager()
 
-# Initialize database on import
+# Initialize database on import with retry logic
+def init_database_with_retry(max_retries=3, delay=2):
+    for attempt in range(max_retries):
+        try:
+            db_manager.create_tables()
+            db_manager.migrate_capital_json_to_db()
+            logger.info("Database initialized successfully")
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Database init attempt {attempt + 1} failed: {e}. Retrying in {delay}s...")
+                import time
+                time.sleep(delay)
+            else:
+                logger.critical(f"Database initialization failed after {max_retries} attempts: {e}", exc_info=True)
+                raise
+
 try:
-    db_manager.create_tables()
-    db_manager.migrate_capital_json_to_db()
-except Exception as e:
-    logger.error(f"Database initialization failed: {e}")
+    init_database_with_retry()
+except Exception as critical_error:
+    logger.critical(f"CRITICAL: Database cannot be initialized: {critical_error}")
+    # Don't raise here - let the app handle it gracefully

@@ -94,27 +94,41 @@ class AutomatedTrader:
     # ------------------------------------------------------------------ #
     #  MAIN LOOP
     # ------------------------------------------------------------------ #
-    def _trading_loop(self):
-        logger.info("Automated trading loop started")
+    async def _trading_loop(self):
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+
         while self.running:
             try:
-                if not self.trading_engine.is_trading_enabled():
-                    logger.warning("Trading engine disabled – stopping")
-                    self.stop()
-                    break
+                # Original sleep was here, replaced by the backoff mechanism below.
+                # If no error, this will effectively be a 1-second sleep, then cycle.
+                # A more precise sleep for the scan_interval would be:
+                # await asyncio.sleep(self.scan_interval)
+                # However, the original code had a loop for sleep, so we maintain that logic.
+                # For a production system, a single asyncio.sleep(self.scan_interval) is better.
 
-                asyncio.run(self._execute_trading_cycle())
+                await self._execute_trading_cycle() # Execute the cycle first
 
-                # Sleep with interruption support
+                # Sleep with interruption support, similar to original code's intent
                 for _ in range(self.scan_interval):
                     if not self.running:
                         break
-                    time.sleep(1)
+                    await asyncio.sleep(1) # Use asyncio.sleep for cooperative multitasking
 
-            except Exception as exc:
-                logger.error("Critical error in trading loop: %s", exc, exc_info=True)
-                if self.running:
-                    time.sleep(60)  # backoff
+                consecutive_errors = 0  # Reset on success
+            except Exception as e:
+                consecutive_errors += 1
+                logger.error(f"Trading loop error (attempt {consecutive_errors}/{max_consecutive_errors}): {e}", exc_info=True)
+
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.critical("Max consecutive errors reached - stopping trading loop")
+                    self.stop()
+                    break
+
+                # Exponential backoff
+                backoff = min(300, 60 * (2 ** consecutive_errors))
+                logger.warning(f"Backing off for {backoff}s before retry")
+                await asyncio.sleep(backoff)
 
     # ------------------------------------------------------------------ #
     #  ONE CYCLE
@@ -125,7 +139,10 @@ class AutomatedTrader:
             self.last_scan_time = datetime.now(timezone.utc)
             exchange = self.trading_engine.exchange
 
-            logger.info("Starting scan #%s on %s (%s mode)", self.scan_count, exchange.upper(), self.trading_engine.account_type)
+            logger.info("Starting scan #%s on %s (%s mode) for user %s", 
+                       self.scan_count, exchange.upper(), 
+                       self.trading_engine.account_type,
+                       self.trading_engine.user_id)
 
             # 1. Get top symbols
             symbols = get_top_symbols(exchange, limit=self.max_symbols)
@@ -133,13 +150,34 @@ class AutomatedTrader:
                 logger.warning("No symbols fetched for %s", exchange)
                 return
 
-            # 2. Generate signals
-            signals = generate_signals(
-                exchange=exchange,
-                timeframe=self.timeframe,
-                max_symbols=self.max_symbols,
-                user_id=self.trading_engine.user_id
-            )
+            # 2. Generate signals with proper error handling
+            signals = [] # Initialize signals to empty list
+            try:
+                raw_signals = generate_signals(
+                    exchange=exchange,
+                    timeframe=self.timeframe,
+                    max_symbols=self.max_symbols,
+                    user_id=self.trading_engine.user_id
+                )
+
+                # Ensure signals have proper structure
+                if raw_signals:
+                    for sig in raw_signals:
+                        if 'exchange' not in sig:
+                            sig['exchange'] = exchange
+                        if 'user_id' not in sig:
+                            sig['user_id'] = self.trading_engine.user_id
+                        # Ensure TP/SL are included
+                        if 'sl' not in sig:
+                            sig['sl'] = None
+                        if 'tp' not in sig:
+                            sig['tp'] = None
+                        signals.append(sig) # Append validated signal
+
+            except Exception as sig_err:
+                logger.error("Signal generation failed for %s: %s", exchange, sig_err)
+                # Continue execution if signal generation fails, to allow other parts of the cycle to run
+                # If signals is empty, the subsequent logic will handle it.
 
             self.total_signals_generated += len(signals)
 
@@ -147,15 +185,14 @@ class AutomatedTrader:
                 logger.info("No high-confidence signals this cycle")
                 return
 
-            logger.info("Generated %s signals", len(signals))
+            logger.info("Generated %s signals for %s", len(signals), exchange)
 
             # 3. Send notifications
             if self.notification_enabled:
-                for sig in signals:
-                    try:
-                        send_all_notifications(sig)
-                    except Exception as e:
-                        logger.error("Notification failed: %s", e)
+                try:
+                    send_all_notifications(signals)
+                except Exception as e:
+                    logger.error("Notification failed: %s", e)
 
             # 4. Execute trades (only if auto-trading enabled)
             if self.auto_trading_enabled:
@@ -171,19 +208,23 @@ class AutomatedTrader:
                     side = sig["side"]
 
                     try:
-                        logger.info("Executing %s %s @ %.2f", side, symbol, sig["entry"])
+                        logger.info("Executing %s %s @ %.2f on %s (%s)", 
+                                   side, symbol, sig["entry"], exchange,
+                                   self.trading_engine.account_type)
 
-                        success = await self.trading_engine.execute_trade(sig)
+                        # Execute trade with proper await
+                        success = await self._execute_trade_async(sig)
+
                         if success:
                             self.successful_trades += 1
                             open_positions += 1
-                            logger.info("Trade executed: %s %s", side, symbol)
+                            logger.info("Trade executed: %s %s on %s", side, symbol, exchange)
                         else:
                             self.failed_trades += 1
-                            logger.warning("Trade failed: %s %s", side, symbol)
+                            logger.warning("Trade failed: %s %s on %s", side, symbol, exchange)
                     except Exception as exc:
                         self.failed_trades += 1
-                        logger.error("Execution error for %s: %s", symbol, exc, exc_info=True)
+                        logger.error("Execution error for %s on %s: %s", symbol, exchange, exc, exc_info=True)
 
             # 5. Update ML model
             self._update_ml_feedback()
@@ -269,17 +310,22 @@ class AutomatedTrader:
 
         logger.info("Force scan triggered")
         try:
+            # Use asyncio.run for synchronous context like this force_scan method
             asyncio.run(self._execute_trading_cycle())
+            # Re-run generate_signals to get the count, as _execute_trading_cycle might have modified state
+            # Or, better, capture the count directly from _execute_trading_cycle if possible.
+            # For now, re-running to match original logic.
+            signals_generated_count = len(generate_signals(
+                exchange=self.trading_engine.exchange,
+                timeframe=self.timeframe,
+                max_symbols=self.max_symbols,
+                user_id=self.trading_engine.user_id
+            ))
             return {
                 "success": True,
                 "message": "Force scan completed",
                 "scan_time": datetime.now(timezone.utc).isoformat(),
-                "signals_generated": len(generate_signals(  # re-run to count
-                    exchange=self.trading_engine.exchange,
-                    timeframe=self.timeframe,
-                    max_symbols=self.max_symbols,
-                    user_id=self.trading_engine.user_id
-                ))
+                "signals_generated": signals_generated_count
             }
         except Exception as exc:
             logger.error("Force scan failed: %s", exc)
@@ -315,4 +361,17 @@ class AutomatedTrader:
             return updated
         except Exception as exc:
             logger.error("Failed to update settings: %s", exc)
+            return False
+
+    # Helper method to execute trades asynchronously
+    async def _execute_trade_async(self, signal: Dict[str, Any]) -> bool:
+        try:
+            # Ensure we're in an async context
+            if asyncio.get_event_loop().is_running():
+                result = await self.trading_engine.execute_trade(signal)
+            else:
+                result = asyncio.run(self.trading_engine.execute_trade(signal))
+            return result
+        except Exception as e:
+            self.logger.error(f"Trade execution failed: {e}", exc_info=True)
             return False

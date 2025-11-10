@@ -1,8 +1,38 @@
 # utils.py
 import math
-from typing import Union
+from typing import Union, Dict, Optional
 
 Number = Union[int, float, str]
+
+# Symbol precision mapping for common trading pairs
+SYMBOL_PRECISION = {
+    "BTCUSDT": 0.01,
+    "ETHUSDT": 0.01,
+    "BNBUSDT": 0.01,
+    "SOLUSDT": 0.001,
+    "XRPUSDT": 0.0001,
+    "DOGEUSDT": 0.00001,
+    "ADAUSDT": 0.0001,
+    "AVAXUSDT": 0.001,
+    "DOTUSDT": 0.001,
+    "LINKUSDT": 0.001,
+}
+
+def get_symbol_precision(symbol: str) -> float:
+    """
+    Get the tick size (price precision) for a given symbol.
+    
+    Parameters
+    ----------
+    symbol : str
+        Trading pair symbol (e.g., 'BTCUSDT')
+    
+    Returns
+    -------
+    float
+        The tick size for the symbol (default 0.01 if not found)
+    """
+    return SYMBOL_PRECISION.get(symbol.upper(), 0.01)
 
 
 def round_to_precision(value: Number, precision: Union[int, float] = 0.0001) -> float:

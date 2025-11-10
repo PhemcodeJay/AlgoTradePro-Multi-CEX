@@ -102,7 +102,7 @@ class BinanceClient:
             server_time = self.exchange.fetch_time()
             self.time_offset = server_time - int(time.time() * 1000)
 
-        
+
 
         self._initialize_session()
         self._test_connection()
@@ -263,19 +263,22 @@ class BinanceClient:
             data = self._make_request("GET", "/fapi/v2/balance", signed=True)
             usdt = next((a for a in data if a['asset'] == 'USDT'), None)
             if usdt:
+                available = float(usdt.get('availableBalance', 0))
+                total = float(usdt.get('balance', 0))
                 return {
-                    'available': float(usdt['availableBalance']),
-                    'total': float(usdt['balance'])
+                    'available': available,
+                    'total': total,
+                    'used': max(total - available, 0.0)
                 }
-            return {'available': 0.0, 'total': 0.0}
+            return {'available': 0.0, 'total': 0.0, 'used': 0.0}
         except Exception as e:
-            logger.error(f"Balance error: {e}")
-            return {'available': 0.0, 'total': 0.0}
+            logger.error(f"Binance balance error: {e}")
+            return {'available': 0.0, 'total': 0.0, 'used': 0.0}
 
     async def place_order(
         self, symbol: str, side: str, qty: float,
         leverage: Optional[int] = None, stopLoss: Optional[float] = None,
-        takeProfit: Optional[float] = None, indicators=None
+        takeProfit: Optional[float] = None, indicators=None, user_id: int = 1
     ) -> Dict:
         db = DatabaseManager()
         try:
@@ -285,16 +288,24 @@ class BinanceClient:
 
             if TRADING_MODE == "virtual":
                 price = self.get_current_price(symbol)
-                order_id = f"virtual_{int(time.time()*1000)}"
-                trade = Trade(
-                    order_id=order_id, symbol=symbol.replace('/', ''), exchange="binance",
-                    virtual=True, side=side, price=price, qty=qty, leverage=leverage or 1,
-                    sl=stopLoss, tp=takeProfit, indicators=indicators or {}, status="open",
-                    created_at=datetime.now(timezone.utc)
-                )
-                db.add_trade(trade)
-                db.session.commit()
-                logger.info(f"Virtual order: {order_id}")
+                order_id = f"virtual_binance_{int(time.time()*1000)}"
+                trade_data = {
+                    "user_id": user_id,
+                    "order_id": order_id,
+                    "symbol": symbol.replace('/', ''),
+                    "exchange": "binance",
+                    "virtual": True,
+                    "side": side,
+                    "entry_price": price,
+                    "qty": qty,
+                    "leverage": leverage or 1,
+                    "sl": stopLoss,
+                    "tp": takeProfit,
+                    "indicators": indicators or {},
+                    "status": "open"
+                }
+                db.add_trade(trade_data)
+                logger.info(f"Virtual Binance order: {order_id}")
                 return {"order_id": order_id, "status": "filled", "virtual": True}
 
             if leverage:
@@ -306,26 +317,36 @@ class BinanceClient:
                 "type": "MARKET",
                 "quantity": f"{qty:.6f}".rstrip('0').rstrip('.'),
             }
+            if stopLoss is not None:
+                params["stopLoss"] = f"{stopLoss:.8f}".rstrip('0').rstrip('.')
+            if takeProfit is not None:
+                params["takeProfit"] = f"{takeProfit:.8f}".rstrip('0').rstrip('.')
+
             result = await asyncio.to_thread(
                 self._make_request, "POST", "/fapi/v1/order", params, signed=True
             )
-            order_id = result["orderId"]
-            trade = Trade(
-                order_id=str(order_id), symbol=symbol.replace('/', ''), exchange="binance",
-                virtual=False, side=side, price=self.get_current_price(symbol), qty=qty,
-                leverage=leverage or 1, sl=stopLoss, tp=takeProfit,
-                indicators=indicators or {}, status="open",
-                created_at=datetime.now(timezone.utc)
-            )
-            db.add_trade(trade)
-            db.session.commit()
-            logger.info(f"Order placed: {order_id}")
+            order_id = str(result["orderId"])
+            trade_data = {
+                "user_id": user_id,
+                "order_id": order_id,
+                "symbol": symbol.replace('/', ''),
+                "exchange": "binance",
+                "virtual": False,
+                "side": side,
+                "entry_price": self.get_current_price(symbol),
+                "qty": qty,
+                "leverage": leverage or 1,
+                "sl": stopLoss,
+                "tp": takeProfit,
+                "indicators": indicators or {},
+                "status": "open"
+            }
+            db.add_trade(trade_data)
+            logger.info(f"Binance order placed: {order_id}")
             return {"order_id": order_id, "status": "filled"}
         except Exception as e:
             logger.error(f"Order error: {e}")
             return {"error": str(e)}
-        finally:
-            db.session.close()
 
     def set_leverage(self, symbol: str, leverage: int) -> bool:
         try:
@@ -382,8 +403,6 @@ class BinanceClient:
         except Exception as e:
             logger.error(f"Cancel error: {e}")
             return False
-        finally:
-            db.session.close()
 
     async def start_websocket(self, symbols: List[str]):
         if not self.loop:
@@ -406,12 +425,27 @@ class BinanceClient:
 
     def close(self):
         try:
-            if self.ws_connection and self.loop:
-                asyncio.run_coroutine_threadsafe(self.ws_connection.close(), self.loop)
+            if self.ws_connection:
+                try:
+                    if self.loop and self.loop.is_running():
+                        future = asyncio.run_coroutine_threadsafe(self.ws_connection.close(), self.loop)
+                        future.result(timeout=5)
+                except Exception as ws_err:
+                    logger.warning(f"WebSocket close warning: {ws_err}")
+            
             if self.session:
-                self.session.close()
-            if self.loop:
-                self.loop.call_soon_threadsafe(self.loop.stop)
-            logger.info("Binance client closed")
+                try:
+                    self.session.close()
+                except Exception as sess_err:
+                    logger.warning(f"Session close warning: {sess_err}")
+            
+            if self.loop and self.loop.is_running():
+                try:
+                    self.loop.call_soon_threadsafe(self.loop.stop)
+                except Exception as loop_err:
+                    logger.warning(f"Loop stop warning: {loop_err}")
+            
+            self._connected = False
+            logger.info("Binance client closed successfully")
         except Exception as e:
-            logger.error(f"Close error: {e}")
+            logger.error(f"Error during close: {e}", exc_info=True)
