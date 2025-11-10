@@ -19,19 +19,20 @@ st.set_page_config(
 # Initialize logger
 logger = get_trading_logger(__name__)
 
+# Initialize session state first
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
 # Header
+username = st.session_state.user.get('username', 'N/A') if st.session_state.user else 'N/A'
 st.markdown("""
 <div style='padding: 1.5rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 1.5rem;'>
     <h1 style='color: white; margin: 0;'>📊 Performance Analytics</h1>
     <p style='color: white; margin: 0.5rem 0 0 0;'>Analyze trading performance for {}</p>
 </div>
-""".format(st.session_state.get('user', {}).get('username', 'N/A')), unsafe_allow_html=True)
-
-# Authentication
-if 'authenticated' not in st.session_state:
-    st.session_state.authenticated = False
-if 'user' not in st.session_state:
-    st.session_state.user = None
+""".format(username), unsafe_allow_html=True)
 
 def authenticate_user(username: str, password: str) -> bool:
     try:

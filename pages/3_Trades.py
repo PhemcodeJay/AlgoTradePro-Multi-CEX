@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import time
+import asyncio
 from datetime import datetime, timezone, timedelta
 from db import db_manager, User, WalletBalance
 from logging_config import get_trading_logger
@@ -20,13 +21,20 @@ st.set_page_config(
 # Initialize logger
 logger = get_trading_logger(__name__)
 
+# Initialize session state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
 # Header
+username = st.session_state.user.get('username', 'N/A') if st.session_state.user else 'N/A'
 st.markdown("""
 <div style='padding: 1.5rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 1.5rem;'>
     <h1 style='color: white; margin: 0;'>💰 Trading Operations</h1>
     <p style='color: white; margin: 0.5rem 0 0 0;'>Manage and execute trades for {}</p>
 </div>
-""".format(st.session_state.get('user', {}).get('username', 'N/A')), unsafe_allow_html=True)
+""".format(username), unsafe_allow_html=True)
 
 # Helpers
 def is_datetime(value: Any) -> bool:
@@ -233,8 +241,15 @@ with col3:
     </div>
     """, unsafe_allow_html=True)
 with col4:
-    wallet = db_manager.get_wallet_balance(account_type, user_id=user_id, exchange=current_exchange)
-    balance = safe_float(wallet.get('available'), 1000.0 if account_type == 'virtual' else 0.0)
+    try:
+        balance_data = trading_engine.get_balance()
+        balance = safe_float(balance_data.get('available', 0.0))
+        if balance == 0.0 and account_type == 'virtual':
+            balance = 1000.0  # Default virtual balance
+    except Exception as e:
+        logger.error(f"Error getting balance: {e}")
+        balance = 1000.0 if account_type == 'virtual' else 0.0
+    
     st.markdown(f"""
     <div style='padding: 1rem; background: #f0f2f6; border-radius: 8px; border-left: 4px solid #f59e0b;'>
         <h4 style='margin: 0; color: #f59e0b;'>💸 Balance</h4>
@@ -508,6 +523,8 @@ with tab3:
             
             if submit_trade:
                 try:
+                    import asyncio
+                    
                     signal = {
                         'symbol': symbol,
                         'side': side,
@@ -522,18 +539,20 @@ with tab3:
                         'user_id': user_id,
                         'exchange': current_exchange
                     }
-                    if account_type == 'virtual':
-                        executed = trading_engine.execute_virtual_trade(signal)
-                    else:
-                        executed = trading_engine.execute_trade(signal)
+                    
+                    # Execute trade using asyncio
+                    with st.spinner("Executing trade..."):
+                        executed = asyncio.run(trading_engine.execute_trade(signal))
+                    
                     if executed:
-                        st.success(f"{'Virtual' if account_type == 'virtual' else 'Real'} trade executed: {side} {quantity} {symbol} at ${entry_price} on {current_exchange.title()}")
+                        st.success(f"✅ {'Virtual' if account_type == 'virtual' else 'Real'} trade executed: {side} {quantity} {symbol} at ${entry_price:.2f} on {current_exchange.title()}")
+                        time.sleep(1)
                         st.rerun()
                     else:
-                        st.error("Failed to execute trade")
+                        st.error("❌ Failed to execute trade. Check logs for details.")
                 except Exception as e:
-                    logger.error(f"Error executing trade: {e}")
-                    st.error(f"Error executing trade: {e}")
+                    logger.error(f"Error executing trade: {e}", exc_info=True)
+                    st.error(f"❌ Error executing trade: {str(e)}")
 
     with col2:
         st.markdown("**Trade Calculator**")

@@ -22,13 +22,21 @@ st.set_page_config(
 # Initialize logger
 logger = get_trading_logger(__name__)
 
+# Initialize session state
+if 'authenticated' not in st.session_state:
+    st.session_state.authenticated = False
+if 'user' not in st.session_state:
+    st.session_state.user = None
+
 # Header
+username = st.session_state.user.get('username', 'N/A') if st.session_state.user else 'N/A'
 st.markdown("""
 <div style='padding: 1.5rem; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); border-radius: 10px; margin-bottom: 1.5rem;'>
     <h1 style='color: white; margin: 0;'>📡 Trading Signals</h1>
     <p style='color: white; margin: 0.5rem 0 0 0;'>Generate and analyze trading signals for {}</p>
 </div>
-""".format(st.session_state.get('user', {}).get('username', 'N/A')), unsafe_allow_html=True)
+""".format(username), unsafe_allow_html=True)
+
 
 
 
@@ -150,16 +158,13 @@ if not st.session_state.get('authenticated', False):
     
     st.stop()
 
-# Initialize components
+user_id = st.session_state.user.get('id', None) if st.session_state.user else None
 if 'trading_engine' not in st.session_state or 'current_exchange' not in st.session_state:
-    st.error("Trading engine not initialized. Please restart the application.")
     st.stop()
 
 trading_engine = st.session_state.trading_engine
 current_exchange = st.session_state.current_exchange
-user_id = st.session_state.get('user', {}).get('id', None)
-account_type = st.session_state.get('account_type', 'virtual')
-username = st.session_state.get('user', {}).get('username', 'N/A')
+account_type = st.session_state.get('account_type', 'virtual') # Define account_type here
 
 # Quick Info Cards
 st.markdown("### 📋 Quick Information")
